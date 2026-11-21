@@ -1,0 +1,387 @@
+# Honest State
+
+> Catalog of what LQ.AI ships today, what is deferred, and how to verify each. Maintained per release. **Last reconciled as a whole at the fiduciary-grade agentic legal work milestone close (ADRs [0018](adr/0018-citation-ledger-and-fiduciary-grade-output.md)–[0021](adr/0021-content-source-registry-and-free-source-expansion.md)); migration head `0064`. Rows for later work, up to v0.9.1 (migration head `0079`), were updated one at a time; the catalog as a whole has not been re-audited since.** (Prior baselines: the legal-research + connectors (MCP) milestone close, #158–#193, head `0055`; before that, the M4 close plus the post-v0.4.0 "Donna" run, #115–#139, head `0047`.)
+
+## In short
+
+- This is LQ.AI's own status board: what's live, what's partial, what's only scaffolding, and what hasn't been built yet — one line per capability.
+- Most statuses come with a way to check it yourself — a file path, a test command, or both; a few (like the pending pen-test engagement) are stated plans instead. Read the Verification column rather than trusting the status word alone.
+- [§6](#6-capabilities-not-yet-started-in-source) lists what doesn't exist yet — worth reading before you assume a feature works because it's mentioned somewhere else.
+- If this file and the actual code ever disagree, the code is right — [open an issue](https://github.com/authrain-cloud-abdullahformuli/lq-ai/issues) so we can fix the doc.
+
+## What this doc is
+
+This document catalogs what LQ.AI ships today, what is deferred, and how an operator can verify each. We publish it in source because the verification path for an open-source project terminates in code, not in a vendor's marketing claims. If you find a discrepancy between this doc and the codebase, the codebase is canonical; please [open an issue](https://github.com/authrain-cloud-abdullahformuli/lq-ai/issues).
+
+## How to read this
+
+Each table has three columns:
+
+- **Capability** — what the operator gets.
+- **Status** — `M1`/`M2`/`M3`/`M4` (shipped today, naming the milestone it landed in; a sub-tag like `M4` or `M3` may name a specific phase for context), `partial` (shipped with explicit caveats, named inline), `scaffold` (plumbing only, feature work deferred), or `deferred-Mx` / `deferred (community-friendly)` for roadmap or [PRD §9](PRD.md#9-deferred-enhancements-and-identified-future-work) items not yet wired in source.
+- **Verification** — the file path, test command, or doc the operator can read to confirm the claim.
+
+Status markers reference the roadmap milestones (M1 → M4) documented in [README.md](../README.md#project-status) and [PRD §8](PRD.md#8-roadmap).
+
+## #658 installed-reference reads (first released in v0.9.1)
+
+On-demand model reads are default-on for enabled, trusted filesystem skills,
+with an independent host-disable policy and retained authorized human supporting-
+file inspection. The initial profile supports admitted `references/` UTF-8 text:
+64 files, 64 KiB per explicit read, safe ASCII paths, no hidden names or symlinks.
+Large files stay discoverable and expose size/range/continuation metadata. Streamed
+validation and hashing retain only one bounded range in memory. Legacy
+`reference/` prompt loading is unchanged. Assets, broader paths, Unicode names,
+complete-list discovery remain compatibility follow-up work. First released in
+v0.9.1; `LQ_AI_SKILL_REFERENCE_READ_ENABLED=false` turns it off. This entry does
+not claim complete Agent Skills support.
+
+Verification targets include `api/tests/skills/test_reference_read.py`, skill
+API/chat and autonomous policy regressions, and supporting-file UI tests.
+The October 17 PR review records agent-run U-1–U-7 workflow checks and final
+maintainer/security review findings, including the durable-result boundary
+correction. See the [operator notes](deploy/skill-capabilities.md).
+The D9/D5 policy clarifications record the maintainer's adopted direction as
+of October 17; no further design-ratification round is required.
+
+## Where M1–M4 sit
+
+**M1 — Foundation (shipped).** Self-hostable conversational legal AI on the starter skills, with the engineering surfaces (audit, tier enforcement, projects/matters, knowledge bases + ingestion, saved prompts, receipts, the skill-creator pipeline) that later milestones build on. Provider adapters: Anthropic, OpenAI, Ollama (local Tier 1).
+
+**M2 — Citation Engine + Anonymization Layer (shipped).** The four-stage citation verification cascade (exact → tolerant → paraphrase judge → ensemble) and the gateway anonymization middleware (Presidio + custom legal recognizers, streaming-aware rehydration, privileged + retrieval skips) both ship operational. The Azure OpenAI provider adapter rounds out the provider set.
+
+**M3 — Playbooks · Tabular Review · Word add-in · Slack/Teams intake bridge (shipped, with two honest caveats).**
+- **Playbooks** and **Tabular / multi-document review** ship operational end-to-end (real execution against documents, with cost tracking and export).
+- The **Word add-in** ships as a **scaffold** — installable, authenticatable, version-safe — but its substantive in-Word feature surfaces (chat, skills with tracked changes, playbook execution) are deferred ([DE-287](PRD.md#9-deferred-enhancements-and-identified-future-work)); today its tabs deep-link to the web app.
+- The **Slack/Teams light intake bridge** ships **partial** — the bridge services, OAuth install flows, encrypted persistence, and admin management are wired and unit-tested, but the flows have **not been exercised end-to-end against live Slack/Microsoft endpoints** ([DE-312](PRD.md#9-deferred-enhancements-and-identified-future-work)), and the `/lq` slash-command surface is inert ([DE-288](PRD.md#9-deferred-enhancements-and-identified-future-work)).
+
+**M4 — Autonomous Layer (shipped).** The background autonomous executor runs real in-loop work: a five-phase LangGraph state machine (intake → analysis → drafting → ethics_review → delivery) where every external action routes through a single `guarded_tool_call` chokepoint enforcing three brakes — R4 (per-session/per-trigger cost cap), R5 (external halt + idle watchdog), R6 (phase-gated tool grants). It ships the four primitives (watches, schedules, per-user memory, precedent board), honest per-session receipts, per-user opt-in, and a full web dashboard. The **Contract Repository auto-relationship graph** (a separate M4-roadmap capability) is **not** built.
+
+**Legal research + connectors (MCP) — gateway-brokered (shipped after M4; #158–#193).** The assistant can now reach external tools — case-law lookup (CourtListener) and operator-approved MCP connectors — but only through the Inference Gateway, which is extended from sole *inference* egress to sole *tool* egress (ADR [0014](adr/0014-gateway-egress-boundary-for-tool-providers.md)/[0015](adr/0015-governed-tool-calling-model.md)). A governed chat tool-loop routes every tool call through a single `governed_tool_invocation` chokepoint; destructive/connector tools pause for an in-chat **persist-and-resume confirmation gate**; case-law results carry **external-source retrieval provenance** ("Sources consulted", kept architecturally distinct from the Citation Engine's character-verified quotes); per-user connector tokens are Fernet-encrypted at rest and never logged. Detailed in [§5.5](#55-legal-research-and-connectors-mcp-gateway-brokered-shipped-after-m4).
+
+**Fiduciary-grade agentic legal work — gateway-brokered (shipped after the legal-research + MCP milestone; ADRs 0018–0021).** Building on the governed tool-loop above, the assistant now keeps a per-turn **Citation Ledger** of every source and passage it actually read, computes a pass/fail **fiduciary gate** over every tool-retrieved citation, can run **governed plain-language matter sessions** through the Autonomous Layer's plan → act → observe → replan loop (the analysis phase's implementation, replacing the single scripted call M4 shipped with), reaches three more free authority sources (GovInfo, SEC EDGAR, EUR-Lex) via a **content-source registry**, and derives a "derived, not editorial" case-law **treatment signal**. Migration head `0064`. Detailed in [§5.6](#56-fiduciary-grade-agentic-legal-work-gateway-brokered-shipped-after-legal-research--mcp).
+
+**The honest reading:** an operator can deploy LQ.AI today for everyday in-house work on the starter skills, with character-verified citation grounding, operator-configurable pseudonymization, codified-position playbooks, multi-document tabular review, an opt-in autonomous background layer with hard economic/temporal/contextual brakes, gateway-brokered legal-research + connector (MCP) access under a governed, human-gated tool-loop, and a fiduciary-grade layer (citation ledger, pass/fail gate, governed matter sessions, free authority sources, treatment signal) on top of it. The deferred edges are: in-Word feature surfaces (scaffold today), live-verified chat-platform intake (plumbing today), the contract relationship graph, a dedicated matter-intake UI (the governed-matter-session backend is shipped; it reuses the autonomous session UI today), chat/autonomous fiduciary-gate verdict-tier parity (DE-371; the chat-side attributed-authority FAIL tier DE-370 is shipped), and EUR-Lex full-text search / treaty coverage (DE-374, DE-375).
+
+---
+
+## 1. Conversational and workspace surface (M1)
+
+The surface in-house counsel touches every day. Every row is wired end-to-end in M1.
+
+| Capability | Status | Verification |
+|---|---|---|
+| Multi-turn chat with persistent history | M1 | `api/app/api/chats.py` |
+| Matter (project) workspace with attached files / skills / KBs | M1 | `api/app/api/projects.py`; `web/src/routes/lq-ai/matters/[id]/+page.svelte` |
+| Slash-invoked skills with provenance pill | M1 | `web/cypress/e2e/wave-d2-skill-creator.cy.ts` Test 4 |
+| Built-in starter skills | M1 | `skills/*/SKILL.md` (read every prompt — no hidden instructions) |
+| Community skill catalog via [`LegalQuants/lq-skills`](https://github.com/LegalQuants/lq-skills) submodule | M1 (opt-in) | `skills/community/` is a git submodule, **empty until initialized** — run `git submodule update --init --remote skills/community` to populate it. The loader walks built-in + community paths with built-in winning on slug collision (`api/app/skills/loader.py`); on a fresh clone with no submodule checkout there are no community skills. |
+| Skill capture / wizard authoring / fork / versions tab | M1 | `web/cypress/e2e/wave-d2-skill-creator.cy.ts` Tests 1–6 |
+| Optional skill persistence and installed bundled Python helpers | Implemented on main; disabled by default; release/security gates pending | Owner/matter/skill/version storage with explicit read/write, inspection/export/reset; named reviewed scripts run through an isolated private broker. Generated-code execution is excluded. [Contract and evidence](plans/issue-563-skill-capabilities.md), [runtime limits and supported paths](deploy/skill-capabilities.md). |
+| Bounded orchestration chat | Implemented on main; disabled by default; human acceptance pending | Model-proposed questions, exact-plan approval, parallel autonomous children applying installed Contract QA, and model synthesis on one fictional agreement. Separate conversational page; ordinary chat, live sources and optional skill storage/helpers are outside this demonstration. [Design](plans/issue-563-chat-demonstration.md), [UAT and evidence](runbooks/adr35-chat-uat.md). The earlier sample-only workflow has been removed; its recording is historical preview evidence only. This row describes the 0.8.0 behavior: one profile, on its own page. v0.9.1 changes that; see the next row. |
+| Governed runs in chat: "New harness" (ADR 0038, **proposed**) | Implemented; first released in v0.9.1; ADR 0038 not ratified; no maintainer or security review; no recorded human acceptance; both profile switches default to off | The chat composer's model picker has one experimental entry, "New harness", first in the list. With it chosen, Send makes one model call: the orchestrator, shown the request, the chat's recent messages (at most 20), the names of any selected documents and the names of the matter's knowledge bases. It either answers by itself (a request that needs nothing read: no plan, no approval, labelled as read from nothing) or hands over a plan of one to four tasks as one `propose_plan` tool call. The owner approves that exact plan. A sub-agent then works on each task with a small set of tools (read a selected document, search the matter's knowledge bases by keyword, keep notes), and the orchestrator combines the results. Quotations written `"words" (Source: [N])` are checked against the file they name, by the Citation Engine's exact and tolerant stages; the application reports which matched and nothing more. A chat need not be in a matter. Both roles are instructed by versioned prompt files, not skills, and the owner can read how each call was set up. The run message is one column of lines. The 0.8.0 fictional demonstration is no longer offered in chat; it can still be started through its stand-alone route (`POST /api/v1/autonomous/orchestration/chat-runs`) while `LQ_AI_ORCHESTRATION_CHAT_ENABLED` is on, and its retained runs stay readable. Code: `api/app/api/chat_runs.py`; `api/app/autonomous/orchestration/` (`new_harness.py`, `profiles.py`, `assembly.py`, `executor.py`, `loop.py`, `tools.py`); migrations `0074` to `0077`; `gateway/app/providers/ollama.py`; `web/src/lib/lq-ai/components/ModelPicker.svelte` and `components/run/`. Evidence: controlled-provider tests (`cd api && pytest tests/autonomous/orchestration`) and single runs by agents on local models. [ADR 0038](adr/0038-governed-runs-in-chat.md), [build plan and implementation status](plans/issue-662-c1-governed-runs-in-chat.md#implementation-status). The [UAT runbook](runbooks/adr38-runs-in-chat-uat.md) was rewritten for New harness and no person has followed it. No walkthrough of the present build is recorded; the first build's was removed from the branch. |
+| Saved Prompts library with one-click "Use in chat" | M1 | `api/app/api/saved_prompts.py`; `web/cypress/e2e/wave-m1-final-surfaces.cy.ts` Test 1 |
+| Knowledge bases — create, attach documents, ingest to `ready` (hybrid BM25 + vector retrieval) | M1 | `api/app/api/knowledge_bases.py`; `api/app/workers/document_pipeline.py` |
+| Ingest formats — **PDF** (PyMuPDF) and **plain text / Markdown** (`parse_text`, verbatim canonical text → exact-match citations; non-UTF-8 → `decode_error`). DOCX is roadmap. A Docling dependency shipped alongside PyMuPDF but **has never produced output** (broken since C5); ingestion is PyMuPDF-only and Docling is being removed per ADR 0026. | M1 (PDF); post-v0.5.0 (text/md, DE-332) | `api/app/pipeline/parsers.py`; `api/app/pipeline/ingest.py` |
+| Receipts drawer with per-event provenance | M1 | `api/app/api/chat_receipts.py`; `web/cypress/e2e/wave-m1-final-surfaces.cy.ts` Test 3 |
+| Enhance Prompt (⌘E) | M1 | `api/app/api/enhance_prompt.py` |
+| Audit log of all sensitive actions | M1 | `api/app/audit.py`; admin reads at `/lq-ai/admin/audit-log` |
+| Admin account provisioning and password reset; immediate access/MFA token invalidation on password change or reset, including CLI reset | Implemented; creation/reset controls in Developer Support's existing Role management card | `api/app/api/admin.py`; `api/app/security/jwt.py`; `web/src/lib/lq-ai/components/DevRoleManagementCard.svelte`; `api/tests/test_admin_user_provisioning.py` (including concurrent refresh/reset); [token lifecycle](security/cryptography.md#per-user-credential-invalidation) |
+| FTS over chat history | M1 | `api/app/api/chats.py` (search route); migration `0016_chat_messages_fts.py` |
+| GDPR-aligned export and account deletion | M1 | `api/app/workers/user_export.py`; `api/app/workers/user_deletion.py`; `api/app/api/users.py` |
+| Per-message ephemeral file attach (`MessageCreate.file_ids` → `applied_file_ids` echo; separate channel from `skill_inputs`, injected as document-context per Decision M2-1) | post-v0.4.0 (#116/#117) | `api/app/schemas/chats.py` (`file_ids`, `applied_file_ids`); `api/app/schemas/gateway.py` (`lq_ai_file_ids`) |
+| Self-service profile edit (`PATCH /api/v1/users/me`, `display_name` only; email is [DE-329](PRD.md#9-deferred-enhancements-and-identified-future-work)) | post-v0.4.0 (#118) | `api/app/api/users.py` |
+| Pending-deletion visibility (`deletion_scheduled_at` on `GET /users/me`; `/users/me/delete/cancel` clears it) | post-v0.4.0 (#120) | `api/app/api/users.py` |
+
+**Caveats (honest), governed runs in chat (ADR 0038, proposed):**
+
+- **Unratified, and released in v0.9.1.** ADR 0038 is not ratified, but the implementation ships in v0.9.1. `LQ_AI_ORCHESTRATION_CHAT_ENABLED` and `LQ_AI_NEW_HARNESS_ENABLED` both default to off. The direct answer, a run in a chat that is in no matter, and the selection of a file a knowledge-base search finds amend ADR 0035 D1, D2 and D3, which are Accepted. ADR 0038 D1 gives the words, and they are ratified with it.
+- **Local models, single runs, no hosted provider.** Tests use a controlled provider. Agents also ran New harness on local models through Ollama, through the API and in a browser. Those are single runs and not a rate. They are not the configured-provider acceptance ADR 0038 requires before live operation is claimed.
+- **No recorded human acceptance.** The maintainer used the third increment on a local model on 2026-10-09 and said that it passes C1's acceptance statement (ADR 0038). That is one person's use, not a recorded acceptance: the runs kept as evidence were driven by agents. The [UAT runbook](runbooks/adr38-runs-in-chat-uat.md) was rewritten for New harness and no person has followed it. A walkthrough of the present build was recorded on 2026-10-14 ([record](uat/adr38-runs-in-chat/README.md)): an agent drove the page on a local model through nine scenarios, one run each, which is not human acceptance. The first build's, which showed a profile control beside the picker and Contract QA tasks, was removed from the branch on 2026-10-10.
+- **No security review.** The changes touch authorization, audit and `gateway/**`. Five are on a security path: the gateway changes (a reasoning-effort field, two Ollama tool-call fixes, and a caller's opt-in that restores placeholders in the arguments of the tool calls a reply makes and puts that caller's tool results and earlier call arguments under the request pseudonymization); the rule for a run outside a matter, including a matter's file read on that matter's terms; the roles on runs and the cross-owner read with its audit row; pseudonymization following the operator's setting; and the knowledge-base search. Under ADR 0034, accepted on 2026-10-04, security review means maintainer review with the security-path checklist applied; the project has no separate security team. The DE-294 handoff rules are implemented as tests, not reviewed.
+- **Rulings, and choices inside them.** The maintainer ruled on all eleven of ADR 0038's open questions on 2026-10-09. Four needed code and are built: the quotation pattern, a matter's file read from a chat in no matter, the plan's placeholders, and roles on runs. The last three were built on choices the maintainer has not ruled on, which ADR 0038 lists under each ruling. A ruling is a direction, not a review.
+- **Stated limits.** No streaming; one active run per owner; no case-law, authority or MCP tool; no library skill; the orchestrator cannot read or search by itself, so it has nothing but a plan's results to answer a question about a document from; its prompt tells it to plan for such a question, and no code stops it answering directly (ADR 0038 D1, D7).
+- **No full Docker stack smoke is recorded.** Every run so far used native services, so the Compose and observability-recipe wiring for the worker has not been shown on a running stack.
+- **No browser test in CI.** The browser checks were scripts that agents ran, kept outside the repository.
+- **Tool calls need a capable model.** The pinned model must support native tool calls, for sub-agents and for the planning call. A provider that rejects a request carrying tool schemas leaves the run uncertain, which the owner can then close. A planning call that writes the plan out as text instead of calling `propose_plan` fails the plan. Any other complete reply from it is delivered as the orchestrator's own answer, unverified.
+- **A matter's file in a chat that is in no matter.** A run started from such a chat can read a file that a matter holds, and then runs under the strictest inference-tier floor and the privilege flag of the matters that hold its documents, set at intake and checked again at every admission (ADR 0038, ruling 4; no security review). The composer's strip is not quoted again when such a file is picked, so its route and pseudonymization lines can be out of date for that selection; the picker's note on the file states the terms. A later run in the same chat is shown such a run's answer only if it has the same terms or stricter, and an ordinary turn likewise: it is sent a note in the answer's place, and so is the prompt enhancer (ruled 2026-10-13). For an ordinary turn the answer's floor is that of the matters behind it as they are now, not the floor the run recorded. A run in a matter that selects a file another matter holds through a knowledge base runs under the stricter of the two matters' terms (ruled 2026-10-13; no security review); a file a knowledge-base search finds during a run does not change the run's terms. Ordinary chat applies no matter's terms to a file.
+- **Roles on runs.** Starting a run, approving a plan and rejecting one are refused for a viewer or an auditor, at the route and in the store. These are the only routes in the API that apply the viewer role; elsewhere the role is stored and not enforced, which is finding API-02 of the security audit ([#288](https://github.com/authrain-cloud-abdullahformuli/lq-ai/issues/288)), open as [#576](https://github.com/authrain-cloud-abdullahformuli/lq-ai/issues/576). This change does not close it. An admin or an auditor can read another owner's run, plan and session traces, including prompt and answer text, with one audit row per read. They cannot act on it. The working-file route refuses them, but a task's findings are in the tree and a saved note's text is in the trace, so they read both (ADR 0038, ruling 10; no security review).
+- **Pseudonymization follows the operator's setting and covers the whole request of a run.** A run is pseudonymized where the gateway's setting applies it at the routed tier. A run holds what its tasks read as the owner's own text and says so with an opt-in (ADR 0038 D7, ruling 6), so the gateway pseudonymizes its tool results (a document read, a knowledge-base passage) and the arguments of earlier tool calls with the rest of the request, replaces a name it found anywhere in the request wherever else it stands in that tool text, and restores the placeholders in the arguments of the calls a reply makes, for the planning call and for a task's calls alike. Ordinary chat is unchanged: its retrieved text and its research tools' results are left alone ([DE-269](PRD.md#9-deferred-enhancements-and-identified-future-work) tracks pseudonymizing source documents). The layer recognises what it recognises, organisation names are not replaced, and a miss is silent. A plan that still carries a placeholder, one the gateway did not assign, is refused. This is a change to the security boundary with no security review. It is exercised by tests on a mocked and a controlled provider, and was run once on a development stack with a local model on a route that pseudonymizes (single runs, driven by an agent).
+- **Knowledge-base search is by keyword only.** A passage is found only when it holds every word of the query. No query embedding is requested.
+- **Placeholders.** New harness's limits (262,144 input bytes and 8,192 output tokens per call, five tool turns per task, 40,000 characters per read, 12,000 characters per task answer, 16,384 per combined answer, eight documents, a two-hour deadline) are not measured. Its quotation checks use the Citation Engine's exact and tolerant stages only, with no judge model; a quotation they cannot match is recorded as unverified and flags the gate. A quotation with Markdown emphasis around its quotation marks is recognised and checked, in ordinary chat and in runs (ADR 0038, ruling 2; unreviewed); emphasis written inside the quotation marks is not removed.
+- A passing run shows that the flow, the controls and the records work. It does not show that an answer is legally sound.
+
+---
+
+## 2. Inference gateway and providers
+
+The Inference Gateway is the security boundary — the only component holding privileged provider API keys and the only component making outbound calls. As of the legal-research + MCP milestone this extends from inference egress to **tool egress**: case-law (CourtListener) and MCP-connector calls also leave only through the gateway, SSRF-guarded and audited (see [§5.5](#55-legal-research-and-connectors-mcp-gateway-brokered-shipped-after-m4)). The backend (`api/app`) holds exactly one outbound HTTP client, pointed at the gateway. Four provider adapters ship: Anthropic, OpenAI, Azure OpenAI, Ollama (local Tier 1). Google Vertex AI remains deferred. The Bedrock compatible-API implementation now covers explicit Messages, Chat Completions and stateless Responses transports, with live AWS verification deferred beyond 0.9.1 by maintainer direction; see [release acceptance and the deferred verification plan](bedrock-verification.md).
+
+| Capability | Status | Verification |
+|---|---|---|
+| Inference gateway with provider routing | M1 | `gateway/app/router.py` |
+| API/worker gateway HTTP timeout (ADR 0027): default 900s, operator override `LQ_AI_GATEWAY_TIMEOUT_SECONDS`, connect capped at the shorter of 10s and the configured value; API budget must exceed adapter budgets | post-v0.8.0 | `api/app/config.py`; `api/app/clients/gateway.py`; `.env.example` / `.env.release.example`; both Compose recipes; `cd api && pytest tests/test_gateway_timeout_setting.py` |
+| Anthropic / OpenAI / Ollama provider adapters | M1 | `gateway/app/providers/{anthropic,openai,ollama}.py`; Ollama via `docker compose --profile local` |
+| Azure OpenAI provider adapter | M2 | `gateway/app/providers/azure_openai.py` ([DE-267](PRD.md#9-deferred-enhancements-and-identified-future-work), closed in M2) |
+| Google Vertex AI provider adapter | deferred (community-friendly) | Wire-format spec in PRD §9 (DE-034) |
+| AWS Bedrock compatible-API provider | implemented; live AWS verification deferred beyond 0.9.1 | `gateway/app/providers/bedrock.py`; [verification gates](bedrock-verification.md); credit @dropthejase, #265 |
+| Tier enforcement (Tiers 1–5) + privileged-matter tier floor | M1 | `gateway/app/tier_floor.py` |
+| Anonymization pre/post middleware | M2 | `gateway/app/anonymization/middleware.py` (wired on the request path at `gateway/app/api/inference.py`); see §3.2. Recognizer accuracy on a legal corpus is empirically unmeasured — [DE-282](PRD.md#9-deferred-enhancements-and-identified-future-work). |
+| Routing log (per-inference) | M1 | `gateway/app/routing_log.py` |
+| Untrusted-content isolation — documents, skill inputs, retrieved chunks kept out of the model's instruction channel | **not shipped.** Envelope hardening only (post-v0.7.1): unconsumed caller-supplied skill inputs are JSON-encoded into a source-labelled block under a data-not-instructions policy. Placeholder-consumed inputs remain in the skill text, with input-created assembler headings backslash-escaped. Skill inputs, retrieved KB chunks, and attachments still ride in the system message. | `gateway/app/skills/assembler.py`; `cd gateway && pytest tests/test_skill_assembler.py`; relocation tracked as [DE-388](PRD.md#9-deferred-enhancements-and-identified-future-work) |
+| Provider-key encryption at rest (Fernet master-key) | M1 | `gateway/app/secrets.py`; `docs/security/encrypted-keys.md` |
+| Hot-reload of gateway config via SIGHUP | M1 | `gateway/app/config_holder.py`; `docs/adr/0010-gateway-config-hot-reload.md` |
+| Runtime provider keys / BYOK (gateway `/admin/v1/provider-keys` + backend is_admin proxy `/api/v1/admin/provider-keys`; GET masked last4/configured/source `env`\|`runtime`; POST Fernet-encrypts into `gateway.yaml` and hot-applies the adapter in-place with no restart; PATCH rotates, DELETE revokes; requires `LQ_AI_GATEWAY_MASTER_KEY` else 400 `failed_precondition`; env keys still work and show source `env`) | post-v0.4.0 (#128) | `gateway/app/provider_keys.py`, `gateway/app/api/admin.py`; `api/app/api/admin.py` (proxy); `api/app/clients/gateway.py` |
+
+---
+
+## 3. M2 — Citation Engine and Anonymization Layer (shipped)
+
+### 3.1 Citation Engine — 4-stage cascade
+
+Character-level verification of every model-emitted citation against source documents; failed citations surface as "unverified" rather than confident wrong text.
+
+- **Cascade** (`api/app/citation/verification.py`): Stage 1 `verify_exact_match` → Stage 2 `verify_tolerant_match` (rapidfuzz ≥95 + normalization) → Stage 3 `verify_paraphrase` (LLM judge via gateway) → Stage 4 `verify_ensemble` (N-model parallel, strict/majority, cost-budget fallback to Stage 3).
+- **Endpoint:** `GET /api/v1/chats/{chat_id}/messages/{message_id}/citations`; rows persist in `message_citations` (migrations `0025`–`0027`). Candidates that miss every stage are not persisted — the UI reads the absence as "unverified" (red).
+- **Verify:** `cd api && pytest tests/citation/ tests/test_chat_citations.py`; full reference in [`docs/citation-engine.md`](citation-engine.md).
+- **Known limitation:** a quote spanning two retrieved chunks silently drops at extraction ([DE-277](PRD.md#9-deferred-enhancements-and-identified-future-work); pinned by `api/tests/citation/test_edge_cases.py`).
+
+### 3.2 Anonymization Layer — gateway middleware
+
+Pseudonymizes named entities before requests leave for the provider; rehydrates originals on the response path (streaming-aware). **The middleware is wired and running** — `pre_anonymize_request` is called on the request path in `gateway/app/api/inference.py` after tier derivation, before provider dispatch.
+
+- **Recognizers** (`gateway/app/anonymization/engine.py`): Presidio defaults (`PERSON`, `ORGANIZATION`, `EMAIL_ADDRESS`, `PHONE_NUMBER`, `LOCATION` via spaCy `en_core_web_lg`) + custom `CaseNumberRecognizer` + `MatterNumberRecognizer`.
+- **Skip conditions** (any one short-circuits): master switch off; Tier 1 (local); privileged chat; per-request opt-out (citation judge calls use this); per-message retrieval-context skip (so the model sees intact source quotes for citation grounding).
+- **Mapper** is per-request, in-memory only — never persisted, never logged.
+- **Verify:** `cd gateway && pytest tests/anonymization/ tests/test_inference_anonymization.py`; full reference in [`docs/security/anonymization.md`](security/anonymization.md). Open surfaces: pseudonymize-source-docs ([DE-269](PRD.md#9-deferred-enhancements-and-identified-future-work)), per-request salt ([DE-274](PRD.md#9-deferred-enhancements-and-identified-future-work)).
+
+---
+
+## 4. M3 — Playbooks · Tabular Review · Word add-in · Intake bridges
+
+### 4.1 Playbooks — shipped
+
+Codified legal positions with detection + redline strategy, plus an "easy" auto-generation pipeline from a document corpus.
+
+| Capability | Status | Verification |
+|---|---|---|
+| Playbook CRUD + execute against a document | M3 | `api/app/api/playbooks.py` (`GET/POST/PATCH/DELETE /api/v1/playbooks`, `POST /playbooks/{id}/execute`, `GET /playbook-executions/{id}`); executor `api/app/playbooks/` |
+| Built-in seeded playbooks (NDA mutual/unilateral, MSA, DPA) | M3 | migrations `0032`/`0033`; `cd api && pytest tests/test_builtin_nda_playbooks.py` |
+| Easy playbook auto-generation (3-stage) | M3 | `POST /api/v1/playbooks/easy` + `GET /playbooks/easy/{id}`; migration `0035` |
+| Tables: `playbooks`, `playbook_positions`, `playbook_executions`, `easy_playbook_generations` | M3 | migrations `0031`, `0035` |
+| Learn viz | M3 | `web/static/learn/playgrounds/playbook-cascade.html` |
+
+**Caveats (honest):** execution runs in-process via FastAPI BackgroundTasks (not arq) per the M3 architecture decision; soft-delete only; built-ins are immutable (admins fork to edit); tracked-changes rendering into Word is deferred ([DE-287](PRD.md#9-deferred-enhancements-and-identified-future-work)).
+
+### 4.2 Tabular / multi-document review — shipped
+
+Run a skill (or ad-hoc column spec) across a document corpus into a document × column grid with per-cell confidence + citations; export XLSX/CSV.
+
+| Capability | Status | Verification |
+|---|---|---|
+| Cost preview · execute · list · get · cancel · soft-delete | M3 | `api/app/api/tabular.py`; arq job `api/app/workers/tabular_worker.py`; table `tabular_executions` (migration `0036`) |
+| Export to XLSX (cell comments) / CSV (citation links) | M3 | `GET /api/v1/tabular/executions/{id}/export` |
+| Column-spec snapshot at execution start (auditable invariant) | M3 | `api/app/models/tabular.py` (columns JSONB snapshot) |
+| Per-cell provenance (DE-309): deterministic verbatim matches mint real ids/offsets in `tabular_cell_citations` (migration 0079); GET/cancel select minted rows by persisted `m3-c2-v2` even with zero matches. Legacy-v1 and exports keep bridge ids; read-side source enrichment remains batched. The OpenAPI sketch names the result components since #422 ([DE-330](PRD.md#9-deferred-enhancements-and-identified-future-work)) | DE-309 (#420) | `api/app/tabular/nodes.py`; `api/app/api/tabular.py`; `api/tests/tabular/test_cell_citations.py`; `api/tests/test_tabular_endpoints.py` |
+| Per-column ensemble verification honored at execution (ensemble cells run one Stage-4 ensemble pass over cited chunks; `verification_method` `ensemble_strict`/`ensemble_majority`/None persisted on cells + mirrored onto citations; preview adds `ensemble_cells_count` + `ensemble_premium_usd`, included in `estimated_cost_usd`; precedence column > skill snapshot > deployment default; no mid-run ceiling — [DE-331](PRD.md#9-deferred-enhancements-and-identified-future-work)) | post-v0.4.0 (#127) | `api/app/tabular/nodes.py` (`_verify_cell_ensemble`), `api/app/tabular/cost.py`; `api/app/schemas/tabular.py` |
+| Learn viz | M3 | `web/static/learn/playgrounds/tabular-review.html` |
+
+**Coverage boundary:** tabular has unit/component coverage (`api/tests/tabular/`) plus live-DB GET/cancel provenance regressions (`api/tests/test_tabular_endpoints.py`) and bulk-operation endpoint tests. These do not substitute for a full worker-to-browser acceptance run. The legacy `parent_execution_id` sibling field remains separate from the retained `tabular_bulk_ops` implementation.
+
+### 4.3 Word add-in (Office.js) — scaffold only
+
+| Capability | Status | Verification |
+|---|---|---|
+| Installable Office.js add-in (manifest, task pane, React shell) | scaffold (M3) | `word-addin/manifest.xml`, `word-addin/src/taskpane/` |
+| Admin manifest download + version handshake | M3 | `api/app/api/word_addin.py` (`GET /api/v1/admin/word-addin/manifest`, `GET /api/v1/word-addin/version`) |
+| OAuth sign-in (reuses `/auth/login` + refresh) | M3 | `word-addin/src/taskpane/auth.ts`; `web/src/routes/lq-ai/word-addin/oauth-start/` |
+| Learn viz | M3 | `web/static/learn/playgrounds/word-addin-flow.html` |
+| In-Word chat / skills (tracked changes + comments) / playbook execution | **deferred** | The three tabs render deep-link cards to the web app, not in-Word feature surfaces — [DE-287](PRD.md#9-deferred-enhancements-and-identified-future-work) |
+
+**Honest assessment:** the add-in is installable, authenticatable, and version-safe, but every substantive feature surface is a placeholder pointing to the web app. Do not market it as feature-shipped.
+
+### 4.4 Slack / Teams light intake bridge — partial
+
+| Capability | Status | Verification |
+|---|---|---|
+| Slack bridge service + OAuth install + encrypted persistence | partial (M3) | `slack-bridge/` (compose `--profile slack`, port 8002); table `slack_workspaces` (migration `0037`, Fernet-encrypted bot token under a distinct master key); `api/app/api/integrations_slack.py` |
+| Teams bridge service + multi-tenant admin-consent OAuth | partial (M3) | `teams-bridge/` (compose `--profile teams`, port 8003); table `teams_tenants` (migration `0038`); `api/app/api/integrations_teams.py` |
+| Admin intake-bridges management (list + soft-delete) | M3 | `api/app/api/admin_intake_bridges.py`; `web/src/routes/lq-ai/admin/intake-bridges/+page.svelte` |
+| `/lq` slash-command intake surface | **deferred** | Webhook handler is signature-verified but inert — [DE-288](PRD.md#9-deferred-enhancements-and-identified-future-work) |
+| End-to-end OAuth against live Slack/Microsoft | **unverified** | Never exercised against a live tunnel — [DE-312](PRD.md#9-deferred-enhancements-and-identified-future-work); see [`docs/intake-bridges.md`](intake-bridges.md) "Honest state up front" |
+
+---
+
+## 5. M4 — Autonomous Layer (shipped)
+
+An opt-in background executor that does real in-loop agentic work under hard brakes. **Not a skeleton** — each phase calls real tools through the chokepoint. Full reference: [`docs/autonomous-layer.md`](autonomous-layer.md). The analysis phase's implementation described below (a single scripted call) was later replaced by a governed plan → act → observe → replan loop under the same brakes — see [§5.6](#56-fiduciary-grade-agentic-legal-work-gateway-brokered-shipped-after-legal-research--mcp).
+
+| Capability | Status | Verification |
+|---|---|---|
+| Five-phase executor (intake → analysis → drafting → ethics_review → delivery) | M4 | `api/app/autonomous/executor.py`, `nodes.py`; arq job `autonomous_session_job` |
+| Real in-loop work: `run_skill`/`run_playbook` inference, `emit_finding`, `propose_memory`, `propose_precedent`, `notify` | M4 | `api/app/autonomous/guard.py` (`_dispatch`); `cd api && pytest tests/autonomous/test_executor_real_work.py` |
+| Single chokepoint `guarded_tool_call` enforcing R5 → R6 → R4 | M4 | `api/app/autonomous/guard.py`; `tests/autonomous/test_executor_skeleton.py::test_no_tool_call_bypasses_chokepoint` |
+| **R4** per-session **and** per-trigger cost cap (`max_cost_usd`) | M4 | `api/app/autonomous/cost.py`; migration `0045`; `tests/autonomous/test_r4_per_trigger_cap.py` |
+| **R5** external halt (`POST /autonomous/sessions/{id}/halt`) + idle watchdog | M4 | `api/app/workers/autonomous_worker.py` (idle cron); `tests/autonomous/test_idle_watchdog.py` |
+| **R6** phase-gated tool grants (`PHASE_GRANTS`) | M4 | `api/app/autonomous/enums.py`; `tests/autonomous/test_brakes.py` |
+| Watches (KB-attach-triggered sessions) | M4 | `api/app/autonomous/watch_trigger.py`; `GET/POST/PATCH/DELETE /autonomous/watches`; table `autonomous_watches` (migration `0039`, `max_cost_usd` in `0045`) |
+| Schedules (in-repo cron dispatcher) | M4 | `api/app/autonomous/cron.py`; `/autonomous/schedules`; table `autonomous_schedules` |
+| Per-user memory (proposed → kept/dismissed) | M4 | `/autonomous/memory/*`; table `autonomous_memory` |
+| Precedent board (race-safe upsert, observed_count) + promote-to-Project proposals | M4 | `/autonomous/precedents/*`, `/autonomous/project-context-proposals/*`; tables `precedent_entries` (migration `0039`), `project_context_proposals` (migration `0041`) |
+| Honest per-session receipt (`terminal_reason`: completed / cost_cap_reached / external_halt / idle_timeout) | M4 | `api/app/autonomous/receipt.py` (`build_receipt` / `build_receipt_safe`); stored in `autonomous_sessions.result` |
+| In-app notifications (durable; best-effort email transport) | M4 | `/autonomous/notifications/*`; table `autonomous_notifications` (migration `0040`) |
+| Per-user opt-in (off by default) | M4 | `User.autonomous_enabled` (migration `0044`); spawn paths + mutate endpoints gated |
+| Findings persistence (`autonomous_findings` written at the `emit_finding` chokepoint; `GET /autonomous/sessions/{id}/findings`; `?source_session_id=` filter on `GET /autonomous/memory`, precedents excluded — recurrence-aggregated) | post-v0.4.0 (#135) | `api/app/api/autonomous.py`; table `autonomous_findings` (migration `0046`) |
+| Document-grade artifacts (opt-in `emit_artifacts`, default OFF; drafting `emit_artifact` chokepoint direct-writes a real KB document — object-storage upload-first, File `ready` + Document + chunks, direct KB attach bypassing watch-fire so no loop; markdown/plain only; `GET /autonomous/sessions/{id}/artifacts`, owner-gated; notification payload `artifact_count`) | post-v0.4.0 (#138) | `api/app/autonomous/guard.py` (`_handle_emit_artifact`), `api/app/api/autonomous.py`; table `autonomous_artifacts` (migration `0047`, session CASCADE / file SET NULL — the document outlives the session) |
+| Matter binding on schedules/watches (`project_id` accepted on create + PATCH incl. clear-to-null; ownership validated at all five assignment sites — create_schedule/create_watch/run-now/two PATCHes — closing a pre-existing IDOR) | post-v0.4.0 (#133) | `api/app/api/autonomous.py` |
+| Retrieval ownership scoping (`retrieve_chunks` verifies the session owner owns the model-supplied `kb_id`/`file_id` before retrieval; mirrors the HTTP visibility predicates (owner scope + `archived_at`/`deleted_at IS NULL`); foreign or unknown ids fail closed with a 404-shaped error, closing a cross-user read reachable via prompt-injected planner args) | post-v0.4.0 (#288 AG-01) | `api/app/autonomous/guard.py` |
+| Worker-side skill registry (shared `app/skills/bootstrap.py::install_skill_registry` from both the api lifespan and the arq-worker `on_startup`; uniform fail-fast on a missing/unreadable skills dir; arq-worker mounts `./skills:/skills:ro` + `LQ_AI_SKILLS_DIR`; SIGHUP reload stays api-only) | post-v0.4.0 (#139) | `api/app/skills/bootstrap.py`; `api/app/workers/arq_setup.py`; `docker-compose.yml` (arq-worker volume) |
+| Web dashboard (sessions/receipt/halt, memory, precedents, watches, schedules, notifications, proposals) | M4 | `web/src/routes/lq-ai/autonomous/`; opt-in toggle at `settings/autonomous/` |
+| Learn viz | M4 | `web/static/learn/playgrounds/autonomous-flow.html` (phase walk + the four brake scenarios; the four *primitives* are not yet visualized — see §11) |
+
+**Honesty notes:** the ethics-review phase is a light v1 (emits a privilege/scope-concerns finding from the structured output; a dedicated ethics LLM gate is a future enhancement). A gateway error mid-analysis produces an honest "analysis failed at the gateway" finding and a completed (not fabricated) receipt. Audit rows carry counts/types/IDs/enums only — never raw entity values or document text.
+
+---
+
+## 5.5 Legal research and connectors (MCP), gateway-brokered (shipped after M4)
+
+After M4, LQ.AI gained the ability to reach *external* tools — case-law lookup and operator-approved MCP connectors — without weakening the gateway boundary. The gateway is extended from sole *inference* egress to sole *tool* egress; a governed chat tool-loop routes every call through one chokepoint; destructive/connector calls pause for explicit human approval; and case-law results carry retrieval provenance kept architecturally distinct from character-verified citations. Shipped across #158–#193 (migrations `0048`–`0055`); design in [ADR 0014](adr/0014-gateway-egress-boundary-for-tool-providers.md) / [ADR 0015](adr/0015-governed-tool-calling-model.md) and [`docs/proposals/legal-research-and-mcp.md`](proposals/legal-research-and-mcp.md) (delivered).
+
+| Capability | Status | Verification |
+|---|---|---|
+| Gateway tool-provider egress boundary — sole tool egress, SSRF-guarded, audited (`tool_egress_log`, counts/types only) | shipped | `gateway/app/providers/tool/` (`validate_egress_target`); migration `0048_tool_egress_log.py`; ADR 0014; `api/app` holds exactly one outbound client → the gateway (`api/app/clients/gateway.py`) |
+| CourtListener case-law provider (search / clusters / citation-lookup against REST v4) | shipped | `gateway/app/providers/tool/courtlistener.py`; `cd gateway && pytest tests/test_courtlistener_adapter.py` |
+| Research API subsystem (`/api/v1/research/*`: capabilities, search + cursor pagination, verify-citations, clusters/opinions/find-in-case) | shipped | `api/app/api/research.py`, `api/app/research/service.py`; migration `0049_research_metadata.py`; `cd api && pytest tests/test_research_endpoints.py tests/test_research_service.py` |
+| MCP client subsystem — gateway adapter (streamable_http, per-call OAuth token injection, tool discovery) | shipped | `gateway/app/providers/tool/mcp.py`; `cd gateway && pytest tests/test_mcp_adapter.py` |
+| MCP registry + discovery-cache + `/api/v1/admin/mcp` surface | shipped | `api/app/api/admin_mcp.py`, `api/app/mcp/service.py`; migration `0050_mcp_tools.py`; `cd api && pytest tests/test_admin_mcp.py tests/test_mcp_service.py` |
+| Per-user MCP OAuth (api flow, tokens Fernet-encrypted at rest, gateway passthrough, `return_url` + connections list) | shipped | `api/app/api/mcp_oauth.py`, `api/app/models/mcp_oauth.py`, `api/app/security/encryption.py`; migrations `0051`/`0052`; `cd api && pytest tests/test_mcp_oauth_service.py tests/test_mcp_encryption.py` |
+| Tool-governance substrate — single `governed_tool_invocation` chokepoint (shared with the autonomous layer) + `tool_call_log` | shipped | `api/app/tools/governance.py`; migration `0053_tool_call_log.py`; ADR 0015; `cd api && pytest tests/test_tool_governance.py` |
+| Governed chat tool-loop + persist-and-resume confirmation gate (in-chat approve/deny resumes the turn; connect-on-demand) | shipped | `api/app/chat/tool_loop.py`, `api/app/api/chats.py` (resume route); migration `0054_chat_pending_tool_call.py`; UI `web/src/lib/lq-ai/components/ToolGatePrompt.svelte`; `cd api && pytest tests/integration/test_chat_tool_call_resume.py` |
+| External-source citations — case-law retrieval provenance ("Sources consulted"), distinct from Citation-Engine verified quotes | shipped | `api/app/models/message_tool_source.py`, `api/app/chat/tool_loop.py` (`extract_tool_sources`); migration `0055_message_tool_sources.py`; UI `web/src/lib/lq-ai/components/ToolSourcesPanel.svelte` + `ProvenancePill.svelte`; `cd api && pytest tests/test_message_tool_sources.py` |
+| `case-law-research` skill + C5 tool-usage (declared via `lq_ai.tool_usage`, surfaced as "Uses: …" in the skill UI; surface-not-enforce) | shipped | `skills/case-law-research/SKILL.md`; `api/app/skills/schema.py`; `web/src/lib/lq-ai/skills/toolUsageNote.ts`; `cd api && pytest tests/test_skills_tool_usage.py` |
+| OpenWebUI MCP stub retired (DE-341) | shipped | `web/backend/open_webui/utils/mcp/` removed; `grep -r "utils.mcp.client" web/backend` is empty; PRD §DE-341 (Resolved in PR6e) |
+| Learn viz — governed-tool-boundary explorer | shipped | `web/static/learn/playgrounds/governed-tool-flow.html` (Learn → How it works) |
+
+**Caveats (honest):**
+
+- **Tool connectors are operator-opt-in, off by default.** The gateway makes no outbound tool calls until an operator enables a `tool_providers` entry (external egress is operator-controlled — ADR 0014). Case-law requires setting `COURTLISTENER_API_TOKEN` in `.env` (forwarded into the gateway container by `docker-compose.yml`) **and** uncommenting the `courtlistener-prod` block in `gateway.yaml` (template in `gateway.yaml.example`), then restarting the gateway; `/api/v1/research/capabilities` reports `enabled: true` once on. MCP connectors register via `/api/v1/admin/mcp` + per-user OAuth. See the README "Enabling legal-research connectors" section. Verified live on a fresh clone (build → migrate `0055` → enable → real CourtListener retrieval → `message_tool_sources` → `tool_egress_log`).
+- The legal-research surface is intentionally scoped: case-law **retrieval** and external-source **provenance** ship; result-content accuracy judging ([DE-280](PRD.md#9-deferred-enhancements-and-identified-future-work)) remains deferred. PRD §3.6 marks the research capability **PARTIAL** accordingly.
+- "Sources consulted" is **retrieval provenance**, not character-verified grounding — it records which external sources a tool call pulled in, and lives in a separate table (`message_tool_sources`) from the Citation Engine's verified quotes (`message_citations`). The two are deliberately never conflated.
+- The Anthropic tool-loop has a known gap when a single turn fans out to multiple read-only tools (consecutive same-role messages the provider rejects) — deferred; single-tool and resume paths are unaffected.
+- Chat-side governed tool calls are audit-logged (`tool_call_log` — counts/types/`args_digest` only, never raw arguments) but do not yet emit a dedicated OTel `chat.tool_call` span (deferred).
+- Runtime BYOK admin provider-keys require `LQ_AI_GATEWAY_MASTER_KEY`; env-configured keys work without it.
+
+---
+
+## 5.6 Fiduciary-grade agentic legal work, gateway-brokered (shipped after legal research + MCP)
+
+Building on the governed tool-loop in [§5.5](#55-legal-research-and-connectors-mcp-gateway-brokered-shipped-after-m4), a fiduciary-grade milestone shipped next: a per-turn ledger of every source the assistant actually read, a pass/fail gate over every tool-retrieved citation, governed plain-language matter sessions on the Autonomous Layer, three more free authority sources, and a derived case-law treatment signal. Migration head `0064` (ledger/gate `0058`/`0059`; treatment `0061`/`0062`; authority citations + text cache `0064`). Design in [ADR 0018](adr/0018-citation-ledger-and-fiduciary-grade-output.md) (citation ledger + fiduciary gate), [ADR 0019](adr/0019-transparent-validity-treatment-layer.md) (treatment layer), [ADR 0020](adr/0020-governed-agentic-legal-matter-sessions.md) (matter sessions), and [ADR 0021](adr/0021-content-source-registry-and-free-source-expansion.md) (content-source registry) — all `Status: Accepted`, all merged.
+
+| Capability | Status | Verification |
+|---|---|---|
+| Citation Ledger — per-turn record of every source/passage actually read (chat + autonomous sessions), one-click trace from a claim to its ledger entry | shipped | `api/app/citation/ledger.py` (`assemble_ledger_entries`/`resolve_ledger_entries`); `GET /api/v1/chats/{chat_id}/ledger` (`api/app/api/chats.py`), `GET /api/v1/autonomous/sessions/{session_id}/ledger` (`api/app/api/autonomous.py`); migration `0058_citation_ledger_entry.py` |
+| Fiduciary-grade gate — derive-don't-assert PASS/FAIL verdict per assistant message, computed from the ledger's own verification statuses | shipped | `api/app/citation/gate.py` (`compute_and_record_gate`); migration `0059_work_product_fiduciary_gate.py`; ADR 0018 D3 |
+| Governed agentic matter sessions — plain-language "describe your matter" query drives a governed plan → act → observe → replan loop confined to the analysis phase, under the same R4/R5/R6 brakes | shipped | `api/app/autonomous/planner.py`; PRs #239/#240; ADR 0020 |
+| Content-source registry + free authority sources — GovInfo (US Code/CFR statutes and regulations), SEC EDGAR (public company filings), EUR-Lex (EU legislation + CJEU case law by CELEX), alongside CourtListener | shipped | `api/app/research/registry.py` (`SOURCE_REGISTRY`); ADR 0021 |
+| Validity / treatment layer — judge-backed, derived case-law treatment signal (e.g. followed, distinguished, criticized) from citing opinions, with one-click trace back to each citing case read | shipped | `api/app/citation/treatment.py` (`derive_treatment_for_message`); migrations `0061_citation_treatment.py`/`0062_citation_treatment_signal.py`; ADR 0019 |
+
+**Caveats (honest):**
+
+- **No dedicated matter-intake UI yet.** The governed matter-session backend (PRs #239/#240) is shipped, but the plain-language "describe your matter" entry point is a backend seam on session state — it reuses the existing autonomous session UI (`web/src/routes/lq-ai/autonomous/`) rather than a purpose-built intake flow.
+- **Chat/autonomous fiduciary-gate verdict-tier parity is incomplete.** The attributed-authority FAIL tier for chat ([DE-370](PRD.md#9-deferred-enhancements-and-identified-future-work)) is shipped — a chat quote attributed to a fetched authority via a nearby statute/reg/CELEX citation FAILs when it cannot be verified against the fetched text; an autonomous-path authority SUPPORTED tier ([DE-371](PRD.md#9-deferred-enhancements-and-identified-future-work)) is still open.
+- **EUR-Lex is get-by-CELEX only.** `SOURCE_REGISTRY["eurlex"].ops == ("get_authority",)` — no `search_authority`. Full-text search via Cellar SPARQL ([DE-374](PRD.md#9-deferred-enhancements-and-identified-future-work)) and treaty/corrigendum CELEX support ([DE-375](PRD.md#9-deferred-enhancements-and-identified-future-work)) are both open.
+- **The Citation Ledger stores no raw payloads.** Per the ADR 0016 P3 no-raw-payload guarantee, ledger entries reference content by id and character offset only — never raw passages or tool payloads — in the audit layer.
+- **The treatment layer is derived, not editorial.** It never emits a definitive "good law / bad law" verdict; every signal is labeled "derived, not editorial," and the per-case judge pass runs under a bounded cost budget (ADR 0019 D4) rather than reading every citing opinion exhaustively.
+- **Free authority sources are operator-opt-in, off by default.** Each requires a configured `tool_providers` entry in `gateway.yaml` (ADR 0021 D1/D5); an unconfigured registry entry is reported unavailable, never fabricated.
+
+---
+
+## 6. Capabilities not yet started in source
+
+Honest milestone deferrals — the subsystem does not yet exist (or only as plumbing). Verifiable by absence.
+
+| Capability | Status | Verification |
+|---|---|---|
+| In-Word feature surfaces (chat/skills/playbooks in the add-in) | deferred (M4 / community) | `word-addin/` tabs are deep-link cards; [DE-287](PRD.md#9-deferred-enhancements-and-identified-future-work) |
+| `/lq` Slack/Teams slash-command intake | deferred | Bridge webhook handlers inert; [DE-288](PRD.md#9-deferred-enhancements-and-identified-future-work) |
+| Contract Repository auto-relationship detection (PRD §3.16) | deferred-M4+ | No `contract_relationships` table in `api/alembic/versions/` |
+
+---
+
+## 7. Compliance and procurement state
+
+The Compliance Alignment Pack at [`docs/compliance/`](compliance/) is a documented commitment; the per-framework alignment docs land incrementally. The pack is the project's contribution to the *operator's* certification work (pre-mapped control responses citing source), not a certification of the project itself.
+
+| Document | Status | Verification |
+|---|---|---|
+| Threat model (STRIDE) / Architecture / Cryptography / Audit-logging / Encrypted-keys / Dependencies | M1 | `docs/security/*.md`, `docs/architecture.md` |
+| Security policy + coordinated disclosure | M1 | [`SECURITY.md`](../SECURITY.md) |
+| SOC2 / ISO 27001 / ISO 42001 / GDPR / HIPAA / FedRAMP alignment | stub | `docs/compliance/README.md` describes the format; per-framework docs land incrementally |
+| OWASP LLM Top 10 / NIST AI RMF profiles | not yet (community-friendly) | mini-PRDs at `docs/contribute/mini-prds/` |
+| Procurement Pack (SIG Lite + CAIQ) | starter | `docs/procurement/sig-lite.md`; full pack [DE-086](PRD.md#9-deferred-enhancements-and-identified-future-work) |
+
+---
+
+## 8. Engineering-discipline state
+
+Engineering rigor is measurable, not asserted. Test **file** counts below are verifiable without standing up the stack (`find … | wc -l`); pass counts run in CI (`.github/workflows/ci.yml`).
+
+| Practice | Status | Verification |
+|---|---|---|
+| Documented test strategy + per-surface E2E coverage matrix | shipped (roadmap 4.1) | [`docs/test-strategy.md`](test-strategy.md) — inventory, surface × depth matrix with real spec paths, CI-reality statement, flake + gap registers |
+| Backend tests (pytest, live Postgres) | M1–milestone | 238 `test_*.py` files in `api/tests/` (incl. `tests/autonomous/`, `tests/citation/`, `tests/tabular/`; pass count refreshed in CI per the `.github/workflows/ci.yml` API gate); `cd api && DATABASE_URL=… pytest` |
+| Gateway tests (pytest) | M1–milestone | 74 `test_*.py` files in `gateway/tests/`; `cd gateway && pytest` |
+| Frontend unit tests (Vitest) | M1–milestone | 84 `*.test.ts` files in `web/src/`; `cd web && npx vitest run` |
+| Cypress E2E (LQ.AI shell) | M1–milestone | 13 spec files in `web/cypress/e2e/` (all LQ.AI-authored; not run in CI, see [`docs/test-strategy.md`](test-strategy.md) §2) |
+| Ruff lint + format (Python) | M1–M4 | `.github/workflows/ci.yml`: `ruff check api scripts` + `ruff format --check` |
+| mypy (api standard, gateway strict) | M1–M4 | CI `mypy app` per subsystem |
+| svelte-check (LQ.AI-owned code) | M1–M4 | `cd web && npm run check:lq-ai` (0 errors on `src/{lib,routes}/lq-ai/**`); inherited OpenWebUI debt tracked as DE-262 (§8.1) |
+| Coverage gate (target 80% api / 90% gateway) | enforced — api at the 80% target; gateway as a no-decrease ratchet at 88% (target not yet met; delta = DE-395) | CI pytest runs with `--cov-fail-under` (`.github/workflows/ci.yml`). Measured 2026-07-25: api 81.49% (12242/15023 stmts) → gated at the 80% target; gateway 88.94% (4464/5019 stmts) → gated at the measured floor of 88%, not the 90% target |
+| Mutation / property-based testing, eval harness, Cypress-in-CI | not yet | On the engineering-discipline roadmap |
+| OpenSSF Scorecard / Best Practices Badge | not yet (community-friendly) | mini-PRDs at `docs/contribute/mini-prds/` |
+| Sigstore-signed images / SBOM / SLSA build provenance per release | landed | `docs/security/releases/README.md`; the v0.7.1 release run logs an attestation per image |
+| SLSA Build Level 3 (provenance from an isolated reusable workflow) | landed in the workflow; first verifiable on the release after v0.7.1 | `.github/workflows/build-image.yml`; verify with `--signer-workflow authrain-cloud-abdullahformuli/lq-ai/.github/workflows/build-image.yml` (see the releases README) |
+| Annual third-party pen test + adversarial red-team | committed; not scheduled | First engagements targeted within 90 days of M1 release |
+
+### Accessibility first slice (DE-232)
+
+The dedicated `accessibility.yml` check uses a production frontend with synthetic API responses, separate from the full-stack nightly Cypress workflow introduced by #432 and the broader per-PR deterministic-track work in #706. It covers seven route states × two viewport widths × two explicit theme preferences. Exact pre-existing noncritical fingerprints are tolerated; every new axe A/AA violation fails. Local measurement: 28 browser variants passed with 230 serious fingerprints recorded from main at `3ecf284177b97ff6acdcaff5eda57bee0bf86a98`; manual/incomplete checks and broader route coverage remain open. The first two GitHub runs passed their production builds but stopped at baseline provenance validation after main changed; the latest local refresh measures main after #710. Passing GitHub scanner evidence and required-check activation remain pending. See [the credited implementation plan](contribute/mini-prds/accessibility-pr-gate.md) and [audit scope](compliance/accessibility-audit.md). Source credit: @SaifAlYounan, #437/#386. This supersedes any older “no browser checks” wording only for this new first slice; DE-232 is not complete.
+
+### 8.1 OpenWebUI fork — inherited TypeScript-check debt
+
+The web frontend is a fork of OpenWebUI (ADR 0001). `npm run check` (full scope) surfaces ~9,359 TypeScript strict-mode signals, all in upstream files inherited at fork time; none in LQ.AI-owned code, none in the (separate Python) gateway. CI scopes the check to LQ.AI code (`npm run check:lq-ai`). Migration tracked as DE-262.
+
+---
+
+## 9. Operational state
+
+| Surface | Status | Verification |
+|---|---|---|
+| Docker Compose reference deployment | M1–M4 + ADR 0036/0037 operations | [`docker-compose.yml`](../docker-compose.yml) — always-on: postgres, redis, rustfs, gateway, api, ingest-worker, arq-worker, web; the opt-in `ops` profile hosts the journaled migration CLI |
+| Local-only profile (Ollama) | M1 | `docker compose --profile local up` — adds the Ollama sidecar. Scanned-PDF OCR / PaddleOCR is not implemented (DE-320); the prior placeholder sidecar was removed. |
+| Slack / Teams bridge profiles | M3 | `docker compose --profile slack up` / `--profile teams up` |
+| Worker skill-registry bootstrap (operator-visible change, #139) | post-v0.4.0 | The api now **fails fast** on a missing/unreadable skills dir at startup (it previously logged a warning and booted with an empty registry); the arq-worker mounts `./skills:/skills:ro` and installs the same registry. `api/app/skills/bootstrap.py`; `docker-compose.yml` |
+| Helm chart for Kubernetes | drafted | [`deploy/helm/lq-ai/`](../deploy/helm/lq-ai/) (worker-migration parity with the compose single-migrator fix is a community item — DE-327) |
+| OpenTelemetry instrumentation (traces + metrics + domain spans) | M1 baseline + M3 domain spans + M4 autonomous spans | [`docs/observability.md`](observability.md) |
+| Reverse-proxy/TLS recipes · backup tooling · complete runbook set · SLOs · status page · postmortem · DR cadence | partial — MinIO→RustFS migration runbook shipped; broader set not yet | `docs/runbooks/minio-to-rustfs.md`; mini-PRDs / deferred |
+
+---
+
+## 10. How to verify everything in this doc
+
+1. Clone the repo and follow the [Quickstart](../README.md#quickstart) to stand the stack up (`docker compose up -d --build` — the api runs migrations 0001→0077 on boot).
+2. Browse the file path or run the test command in the Verification column.
+3. To read source without running the stack, the cited paths are all in the repository.
+
+If a claim does not check out, the codebase is canonical — please [open an issue](https://github.com/authrain-cloud-abdullahformuli/lq-ai/issues). The point of publishing this in source is that verification runs through readable code, not a vendor's representation of it.
+
+---
+
+## 11. Known doc/Learn gaps (this maintenance pass)
+
+- **Learn visualizations to add** (shipped capabilities not yet visualized): intake-bridges (Slack/Teams OAuth + workspace lifecycle); the autonomous **four primitives** (watches/schedules/memory/precedent lifecycle — `autonomous-flow.html` covers phases + brakes only); projects/matters + org-profile + privilege tiers; KB hybrid retrieval (BM25 + vector); the [§5.6](#56-fiduciary-grade-agentic-legal-work-gateway-brokered-shipped-after-legal-research--mcp) fiduciary-grade capabilities (Citation Ledger trace, fiduciary gate, governed matter sessions, content-source registry, treatment layer — none has a Learn playground yet). Tracked in the M4-D2 doc/Learn alignment plan.
+- **Resolved this session (DEs):** DE-325 (`build_receipt_safe` hardening), DE-326 (fresh-install worker alembic-migration race). DE-327 (Helm worker-migration parity) is open as a community-suitable item.
+
+## 12. Maintenance note
+
+Maintained per release. Last rewritten at the **M4 close** (Autonomous Layer shipped end-to-end; fresh-install acceptance passed), reconciled against the post-v0.4.0 "Donna" run (#115–#139; head `0047`), then reconciled against the **legal-research + connectors (MCP) milestone** (#158–#193; migration head `0055`; the release-readiness verification pass for v0.5.0), then reconciled a third time against the **fiduciary-grade agentic legal work milestone** (ADRs 0018–0021; migration head `0064`) as part of the DE-365 docs-honesty audit (`docs/audits/2026-07-01-claims-vs-reality.md`), which added [§5.6](#56-fiduciary-grade-agentic-legal-work-gateway-brokered-shipped-after-legal-research--mcp) and refreshed the header, the M4 cross-reference, and the §8 test-file counts. Rows for later work, up to v0.9.1 (migration head `0079`), have been updated one at a time since; no whole-catalog reconciliation has been done after that third pass. Substantive content drivers: [PRD §3](PRD.md#3-capability-specifications) (capabilities), [PRD §8](PRD.md#8-roadmap) (roadmap), [PRD §9](PRD.md#9-deferred-enhancements-and-identified-future-work) (deferrals), and the per-feature docs (`docs/citation-engine.md`, `docs/playbooks.md`, `docs/tabular-review.md`, `docs/word-addin.md`, `docs/intake-bridges.md`, `docs/autonomous-layer.md`, the ADRs `docs/adr/0014`/`0015` + `docs/proposals/legal-research-and-mcp.md` for the tool-egress/MCP milestone, and ADRs `docs/adr/0018`–`0021` for the fiduciary-grade milestone).

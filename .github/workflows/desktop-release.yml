@@ -1,0 +1,72 @@
+name: Desktop launcher (macOS)
+
+# Builds, signs, and notarizes the "LQ.AI for Mac" launcher .dmg and publishes it
+# to a GitHub Release. Separate pipeline from release.yml (which publishes the
+# container images): this one runs on macOS and needs the Apple signing secrets.
+#
+# Triggered by a `desktop-v*` tag push (e.g. desktop-v0.4.0) or manual dispatch.
+# Keep the image release (`v*`) and the desktop release (`desktop-v*`) as distinct
+# tags so they can be cut independently.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag for the .dmg (e.g. desktop-v0.4.0)'
+        required: true
+  push:
+    tags: ['desktop-v*']
+
+# Least privilege: only enough to publish the .dmg asset to a Release.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Unit tests (pure core)
+        run: npx vitest run
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Resolve the image tag pinned into this launcher
+        id: image-tag
+        env:
+          DESKTOP_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          case "$DESKTOP_TAG" in
+            desktop-v*) echo "value=${DESKTOP_TAG#desktop-}" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Expected a desktop-vX.Y.Z tag, got: $DESKTOP_TAG" >&2; exit 1 ;;
+          esac
+      # `npm run dist` runs prepack:compose first, which copies the repo-root
+      # docker-compose.release.yml into desktop/resources/ before electron-builder
+      # bundles it as an extraResource. The working-directory is `desktop`, so the
+      # script's relative `../docker-compose.release.yml` resolves to the repo root.
+      - name: Build, sign, notarize .dmg
+        env:
+          # electron-builder reads CSC_LINK / CSC_KEY_PASSWORD for the Developer ID
+          # signing identity (stored base64-encoded in MAC_CSC_LINK).
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          # notarytool (native notarize + build/notarize-dmg.cjs for the dmg) reads
+          # these from the env. teamId is ALSO hardcoded in electron-builder.yml
+          # (Part C Trap 1 — electron-builder does not read APPLE_TEAM_ID from env
+          # for the native .app notarize step).
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          LQ_AI_RELEASE_IMAGE_TAG: ${{ steps.image-tag.outputs.value }}
+        run: npm run dist
+      - name: Publish .dmg to the release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: desktop/dist/*.dmg
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}

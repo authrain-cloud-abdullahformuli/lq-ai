@@ -1,0 +1,345 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lq-ai-api"
+version = "0.1.0"
+description = "LQ.AI backend API service"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "LegalQuants" }]
+dependencies = [
+    "fastapi>=0.141.1,<0.147",
+    "uvicorn[standard]>=0.52.1,<0.55",
+    "pydantic>=2.7,<3",
+    "pydantic-settings>=2.4,<3",
+    "sqlalchemy[asyncio]>=2.0.51,<2.2",
+    # The asyncpg window is a CROSS-SERVICE INVARIANT, not a local choice: it
+    # must move in lockstep with gateway/pyproject.toml's, whose comment
+    # records why (one asyncpg ABI per container image in a multi-service
+    # deployment). This bump is paired with the identical bump in gateway/.
+    "asyncpg>=0.31.0,<0.33",
+    # starlette is fastapi's ASGI layer and is imported nowhere in api/app
+    # directly — it is pinned explicitly because 0.48.0 carries 10 known
+    # advisories with no in-range fix (GHSA-7f5h-v6xp-fcq8,
+    # GHSA-82w8-qh3p-5jfq, GHSA-86qp-5c8j-p5mr, GHSA-jp82-jpqv-5vv3,
+    # GHSA-wqp7-x3pw-xc5r, GHSA-x746-7m8f-x49c, PYSEC-2026-161,
+    # PYSEC-2026-1942, PYSEC-2026-2280, PYSEC-2026-2281). Without an explicit
+    # floor the resolver is free to sit on the vulnerable build for as long as
+    # fastapi's own range allows, which is exactly what happened here: the
+    # advisory sat unremediated in this lock while fastapi stayed on 0.116.
+    # Mirrors the same explicit pin in gateway/pyproject.toml.
+    "starlette>=1.4.1,<1.10",
+    "alembic>=1.19.0,<2",
+    "psycopg2-binary>=2.9,<3",
+    "greenlet>=3.0,<4",
+    # A4 dependencies — readiness wiring + clients used at startup.
+    # `redis` ships an async client at `redis.asyncio` (formerly aioredis,
+    # merged into redis-py). One library covers sync + async.
+    "redis>=5.0,<6",
+    # `aioboto3` is an asyncio wrapper over botocore; required because the
+    # backend's storage path (Task C4) is async and we don't want to block
+    # the event loop on file I/O. Pulls boto3/botocore transitively.
+    "aioboto3>=15.5.0,<16",
+    # httpx is FastAPI's recommended async HTTP client and is used by the
+    # gateway client. Already a transitive of fastapi/starlette test deps,
+    # declared explicitly here because we use it at runtime, not just in tests.
+    "httpx>=0.27,<0.29",
+    # B1 — auth dependencies (per ADR 0002).
+    # bcrypt: password hashing + refresh-token-hash. Direct API; we don't
+    # use passlib's bcrypt wrapper because of recurring compatibility
+    # issues with bcrypt 4.x+. Pinned to >=4.1 for consistent gensalt API.
+    "bcrypt>=4.1,<6",
+    # pyjwt: JWT encode/decode for access tokens and MFA challenge tokens.
+    # The [crypto] extra ships the PyCA cryptography backend that pyjwt
+    # uses for signing — keeps a future move from HS256 to RS256/EdDSA
+    # to a config change rather than a dep change.
+    "pyjwt[crypto]>=2.13.0,<3",
+    # email-validator: Pydantic's EmailStr requires this at validation time.
+    # Used by LoginRequest to reject obviously-malformed addresses before
+    # we hit the database. Tiny dep; pulls dnspython transitively.
+    "email-validator>=2.0,<3",
+    # C1 — skill loader. Reads YAML frontmatter from each SKILL.md.
+    # Same library/version range the gateway already uses for gateway.yaml,
+    # so no new SBOM family is introduced (see ADR 0004 for the locus
+    # decision and CLAUDE.md's bar on new dependencies).
+    "pyyaml>=6.0,<7",
+    # C4 — python-multipart: required by Starlette to parse multipart/form-data
+    # request bodies, which is how Task C4's `POST /api/v1/files` accepts
+    # file uploads. Starlette declares it as an optional dep ("multipart"
+    # extra); we pin it directly because we use the `UploadFile` type at
+    # runtime. No new SBOM family — Starlette already supports the same
+    # library; we're moving from "transitive when extras are installed"
+    # to "explicit declaration."
+    "python-multipart>=0.0.20,<0.1",
+    # C5 — document pipeline. New family in the SBOM; each library is
+    # PRD-anchored and called out in ADR 0006.
+    #
+    # PyMuPDF: byte-precise text extraction. The M2 Citation Engine's
+    # deterministic substring verification depends on character-precise
+    # offsets being preserved from the first ingestion (see ADR 0006).
+    # AGPL-3.0 — server-side use only; not redistributed as a library.
+    # Boundary documented in PRD §1519 and §7.2.
+    "pymupdf>=1.24,<2",
+    # Docling: structure-aware parsing (titles, tables, paragraphs).
+    # MIT-licensed; produces a structured representation we stash in
+    # `documents.structured_content` for M2 consumption. M1 chunker
+    # drives off PyMuPDF's character stream, not Docling's offsets.
+    # Heavy install footprint (transformers, sentencepiece) — accepted
+    # for M1 per PRD §3 and §7.6.
+    "docling>=1.16,<2",
+    # arq: Redis-native asyncio job queue for the document-pipeline
+    # worker. MIT-licensed; small dep footprint (just redis-py which
+    # we already have, plus click). Avoids Celery's complexity at
+    # M1 scale; ADR 0006 §2 records the call.
+    "arq>=0.28.0,<0.29",
+    # C6 — tiktoken: BPE tokenizer for OpenAI's text-embedding-3-* family.
+    # Used by app.knowledge.embed.count_tokens to populate
+    # document_chunks.tokens during the embed-on-write path. ADR 0008
+    # records the choice; the dep is small (BSD-3, no transitive deps
+    # beyond `regex`) and the alternative (hand-rolling cl100k_base
+    # BPE) would be hundreds of lines for the same SBOM cost.
+    "tiktoken>=0.7,<1",
+    # D5 — pyotp: RFC 6238 TOTP implementation for MFA enrollment and
+    # verification. MIT-licensed; tiny (~300 LOC, no transitive deps).
+    # The alternative would be hand-rolling HMAC-SHA1 + base32 secret
+    # generation + drift handling, which is the same SBOM cost for a
+    # security-sensitive primitive we'd rather not own.
+    "pyotp>=2.9,<3",
+    # M-Obs.1 — Prometheus /metrics + OpenTelemetry (PRD §5.4). Same
+    # pins as gateway/ so a multi-service deployment doesn't end up
+    # with two SDK ABIs in one Compose stack. OTel SDK is dormant
+    # unless OTEL_EXPORTER_OTLP_ENDPOINT is set (PRD §5.7 "no telemetry
+    # by default"). Apache-2.0 across the OTel family;
+    # prometheus-client is BSD and has no transitive deps.
+    "prometheus-client>=0.20,<1",
+    "opentelemetry-api>=1.27,<2",
+    "opentelemetry-sdk>=1.27,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.27,<2",
+    "opentelemetry-instrumentation-fastapi>=0.48b0,<1",
+    "opentelemetry-instrumentation-httpx>=0.48b0,<1",
+    # M2-B1 — rapidfuzz powers Citation Engine Stage 2 (tolerant-match).
+    # Two uses: (1) extraction-time `partial_ratio_alignment` fallback
+    # when the model's quote isn't a byte-for-byte substring of the
+    # retrieved chunk (smart quotes, whitespace drift); (2) Stage 2
+    # verifier's `fuzz.ratio` against normalized text with threshold
+    # 95. MIT-licensed; C-extension backbone, no runtime config needed.
+    "rapidfuzz~=3.5",
+    # DE-319 / #524 — one maintained runtime for playbook, tabular and
+    # autonomous execution. The 1.x family adds prebuilt/protocol packages
+    # and upgrades Core/checkpoint; review the actual frozen lock as SBOM
+    # changes. All three graphs retain their existing phase behavior;
+    # checkpoint activation belongs to the later #563 integration.
+    "langgraph>=1,<2",
+    # ADR 0035 demonstration: the previously tested saver is now a runtime
+    # dependency. It stays dormant unless the operator enables the demo and
+    # applies orchestration migration 0067. Existing executors retain
+    # their checkpoint-free behavior; psycopg2 remains the migration driver.
+    "langgraph-checkpoint-postgres==3.2.0",
+    "psycopg[binary]>=3.2,<4",
+    # M3-C4 — openpyxl powers the Tabular Review XLSX export
+    # (GET /tabular/executions/{id}/export?format=xlsx). Each grid cell
+    # gets a Comment with its citation source so operators can pivot
+    # from the spreadsheet back into the deployment. CSV export uses
+    # stdlib csv; no pandas dependency. MIT-licensed; no new SBOM
+    # family beyond openpyxl + its single transitive `et-xmlfile`.
+    "openpyxl>=3.1,<4",
+    # PR4c — authlib: vetted OAuth 2.1 client for per-user MCP server
+    # authentication. Provides PKCE, provider metadata discovery, and
+    # token-refresh handling that would otherwise require hand-rolling
+    # security-sensitive code — the alternative fails CLAUDE.md's
+    # dependency bar. BSD-3-Clause; no new SBOM family beyond Cryptography
+    # which we already carry transitively via pyjwt[crypto].
+    "authlib>=1.3,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    # pytest-xdist distributes the test suite across one worker per available
+    # CPU so the 4-core ubuntu-latest runner runs ~4× as many tests in parallel.
+    # Tests are already isolated via per-test transaction rollback (conftest.py),
+    # so parallelisation is safe. Each worker gets its own session-scoped DB and
+    # Alembic migration run. Dev-extra only; not in the runtime SBOM.
+    # Used by PyPI's Warehouse on the same stack (SQLAlchemy + Alembic + Postgres).
+    "pytest-xdist>=3.5",
+    # Coverage gate (roadmap 4.3). Enforced in CI via --cov-fail-under=80 —
+    # the documented target, which measured coverage clears (81.49% on
+    # 2026-07-25). See .github/workflows/ci.yml.
+    "pytest-cov>=7.1",
+    "httpx>=0.27",
+    # Pinned exactly: ruff's formatter output changes across releases, so an
+    # unpinned floor let CI (which resolves latest) drift ahead of dev venvs
+    # and fail `ruff format --check` on code that was clean locally. Pin so
+    # local == CI. Bump deliberately (and reformat) when upgrading.
+    "ruff==0.17.1",
+    "mypy>=1.11",
+    # PyYAML type stubs — pyyaml has no inline typings, so mypy needs the
+    # types-PyYAML package to type-check `app.skills.loader` etc.
+    "types-PyYAML>=6.0",
+    # respx mocks httpx at the transport layer; B5 introduces it on the
+    # api/ side to test the GatewayClient. Already used the same way in
+    # gateway/'s dev deps for the AnthropicAdapter — same library, same
+    # pattern, no new SBOM family.
+    "respx>=0.21",
+    # types-PyYAML — mypy stubs for the C1 skill loader's pyyaml import.
+    # Same pin family the gateway already uses.
+    "types-PyYAML>=6.0",
+    # DE-230 — property-based testing of citation normalization/locator
+    # invariants (tests/property/). MPL-2.0, test-only: never ships in
+    # the product image. Profiles (dev/ci/thorough) are registered in
+    # tests/property/conftest.py; same pin family as gateway/.
+    "hypothesis>=6.161",
+]
+# Compatibility extra for saved test commands; saver dependencies now ship
+# with the disabled-by-default demonstration runtime.
+orchestration-test = []
+
+# Note: a `[project.scripts]` console-script entry was considered for
+# the CLI but the current Dockerfile installs the package metadata only
+# (the `app/` source tree is `COPY`'d in afterward and imported from
+# /app via WORKDIR). A console script would resolve `app.cli:main` at
+# entry-point invocation time but `app` is not on the site-packages
+# path, so the script fails with ModuleNotFoundError. The canonical
+# invocation in docs/quickstart.md is `python -m app.cli` which works
+# from /app/. If/when the Dockerfile is changed to install the real
+# wheel, a `[project.scripts]` block can be reintroduced here.
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.uv]
+# Reviewed transitive minimums for the LangGraph family. A broad 1.x runtime
+# range alone still admits dependencies preceding these fixes. Constraints
+# restrict existing transitive packages without declaring unused direct APIs.
+# Checkpoint: GHSA-fjqc-hq36-qh5p (JSON loading); SDK: GHSA-fvww-7h3r-vfhp
+# (custom resource auth). Neither feature is activated by this migration.
+constraint-dependencies = [
+    "langchain-core>=1.6.3",
+    "langgraph-checkpoint>=4.1.1",
+    "langgraph-sdk>=0.4.4",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Session-scoped fixtures (test_db_url, test_engine) need a session-scoped
+# event loop — otherwise asyncpg connections created during fixture setup
+# end up tied to a function-scoped loop that gets closed between tests.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+markers = [
+    "unit: pure unit tests, no I/O",
+    "integration: tests that hit Postgres/Redis/MinIO/Gateway",
+    "provider: tests that hit a real LLM provider (require API key)",
+    "slow: tests that take longer than 5s",
+    "e2e: end-to-end tests via Playwright",
+]
+
+# DE-229 — mutation testing (mutmut 3.x reads this section from pyproject.toml).
+#
+# Scope is a deliberate critical-module allowlist, not the whole package:
+# full-package mutation over a 237-file suite is hours-to-days, and the
+# value concentrates in the security/citation code whose test suites must
+# catch real defects, not just execute lines. Rationale, the score history,
+# and the local-run recipe live in docs/quality/mutation-scores.md.
+#
+# The allowlist is further restricted to modules whose covering tests are
+# DB-free. mutmut executes tests from a mutants/ sandbox copy, and the
+# Alembic seed migrations (0032/0033) resolve skills/ four parents above
+# the migration file — a layout that doesn't hold inside the sandbox, so
+# any Postgres-backed suite fails at session setup there. Consequence:
+# app/audit.py and the DB-tested citation modules (treatment*, cost,
+# ledger, authority) are OUT of scope for now; see the doc for the
+# follow-up. Do not add DB-bound suites to the test selection below.
+#
+# Runs nightly in .github/workflows/mutation.yml (never as a PR gate).
+# Local run after `uv sync --frozen --extra dev --group mutation`: `mutmut run` from api/ — no DATABASE_URL needed.
+[tool.mutmut]
+source_paths = ["app"]
+# First wave is keyless/model-free; slow NLP integration remains DE-229 work.
+pytest_add_cli_args = ["-m", "not slow and not provider"]
+only_mutate = [
+    # Fernet encryption helpers for provider keys / MCP tokens (ADR 0011).
+    "app/security/encryption.py",
+    # Citation Engine deterministic core (PRD §3.3): extraction →
+    # verification cascade (exact/tolerant/ensemble) + normalization,
+    # caselaw matching, and the judge prompt assembly.
+    "app/citation/normalization.py",
+    "app/citation/extraction.py",
+    "app/citation/verification.py",
+    "app/citation/caselaw.py",
+    "app/citation/judge_prompts.py",
+    "app/citation/authority_content_judge.py",
+]
+# Restrict the stats/clean runs to the DB-free suites that exercise the
+# allowlist — collecting all 237 test files per run would dominate the
+# runtime, and DB-bound suites break inside the sandbox (see above).
+pytest_add_cli_args_test_selection = [
+    "tests/citation/test_normalization.py",
+    "tests/citation/test_extraction.py",
+    "tests/citation/test_exact_match.py",
+    "tests/citation/test_tolerant_match.py",
+    "tests/citation/test_verify_cascade.py",
+    "tests/citation/test_verification_spans.py",
+    "tests/citation/test_ensemble.py",
+    "tests/citation/test_chunk_boundary.py",
+    "tests/citation/test_paraphrase_judge.py",
+    "tests/citation/test_caselaw_extraction.py",
+    "tests/citation/test_caselaw_matching.py",
+    "tests/citation/test_caselaw_verify.py",
+    "tests/citation/test_judge_prompts.py",
+    "tests/citation/test_authority_content_judge.py",
+    "tests/test_encryption.py",
+    "tests/test_mcp_encryption.py",
+]
+
+[tool.mypy]
+strict_optional = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+# aioboto3 / botocore do not ship type stubs (and the boto3-stubs project
+# only stubs sync boto3). The backend uses both in `app/storage.py`; we
+# tell mypy to skip them rather than slathering # type: ignore[import-untyped]
+# at every call site. Per CONTRIBUTING.md, the api/ subsystem uses
+# standard mypy mode (not strict mode), so this is in line with policy.
+[[tool.mypy.overrides]]
+module = ["aioboto3", "aioboto3.*", "botocore", "botocore.*"]
+ignore_missing_imports = true
+
+# C5 dependencies — none ship type stubs. PyMuPDF (`fitz`) and Docling
+# are imported lazily inside `app/pipeline/parsers.py` and used at
+# runtime. arq is imported lazily inside `app/workers/`. The SDKs are
+# active code paths; mypy sees them as untyped.
+[[tool.mypy.overrides]]
+module = ["fitz", "fitz.*", "docling", "docling.*", "arq", "arq.*"]
+ignore_missing_imports = true
+
+# C6 — tiktoken doesn't ship type stubs; its API is small and we use
+# it in one module (app.knowledge.embed). The lazy import is annotated
+# with an inline `type: ignore[import-not-found]` for the optional path
+# but the override here covers the standard case.
+[[tool.mypy.overrides]]
+module = ["tiktoken", "tiktoken.*"]
+ignore_missing_imports = true
+
+# D5 — pyotp has no type stubs (small module, BSD-2-clause; the project
+# does not ship a `py.typed` marker). Imported in app.security.totp.
+[[tool.mypy.overrides]]
+module = ["pyotp", "pyotp.*"]
+ignore_missing_imports = true
+
+# PR4c — authlib ships no type stubs (no py.typed marker). We use only its
+# PKCE + secure-token-generation helpers in app.mcp.oauth (never its HTTP
+# transport — all OAuth HTTP goes through the gateway passthrough).
+[[tool.mypy.overrides]]
+module = ["authlib", "authlib.*"]
+ignore_missing_imports = true
+
+[dependency-groups]
+# DE-229: opt-in only; normal dev/runtime installs exclude mutation tooling.
+mutation = ["mutmut==3.8.0"]

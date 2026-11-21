@@ -1,0 +1,130 @@
+"""ORM models for the LQ.AI backend.
+
+Each model corresponds to a table in docs/db-schema.md. The migration in
+api/alembic/versions/ is the authoritative DDL — these models reflect what
+the migration produces and are the read/write surface for application code.
+
+Import side-effect: importing this module registers every model with the
+declarative base, so Alembic's autogenerate (when used) sees them.
+"""
+
+from __future__ import annotations
+
+from app.models.audit import AuditLog
+from app.models.authority_text_cache import AuthorityTextCache
+from app.models.autonomous import (
+    AutonomousMemory,
+    AutonomousNotification,
+    AutonomousSchedule,
+    AutonomousSession,
+    AutonomousWatch,
+    PrecedentEntry,
+)
+from app.models.chat import Chat, Message
+from app.models.chat_pending_tool_call import ChatPendingToolCall
+from app.models.citation_ledger_entry import CitationLedgerEntry
+from app.models.citation_treatment import CitationTreatment
+from app.models.citation_treatment_signal import CitationTreatmentSignal
+from app.models.document import Document, DocumentChunk
+from app.models.enhance_prompt import EnhancePromptInteraction
+from app.models.file import File
+from app.models.inference import InferenceRoutingLog
+from app.models.knowledge import KnowledgeBase, KnowledgeBaseFile
+from app.models.mcp import MCPToolCache
+from app.models.mcp_oauth import MCPOAuthState, MCPOAuthToken
+from app.models.message_authority_citation import MessageAuthorityCitation
+from app.models.message_caselaw_citation import MessageCaselawCitation
+from app.models.message_tool_source import MessageToolSource
+from app.models.orchestration import (
+    OrchestrationAccount,
+    OrchestrationAdmission,
+    OrchestrationEffect,
+    OrchestrationFile,
+    OrchestrationPlan,
+    OrchestrationRoot,
+)
+from app.models.organization_profile import OrganizationProfile
+from app.models.playbook import Playbook, PlaybookExecution, PlaybookPosition
+from app.models.project import Project, ProjectFile, ProjectSkill
+from app.models.project_knowledge_base import ProjectKnowledgeBase
+from app.models.project_member import ProjectMember
+from app.models.research import ResearchClusterMetadata, ResearchOpinionMetadata
+from app.models.saved_prompt import SavedPrompt
+from app.models.skill_workspace import SkillWorkspace, SkillWorkspaceFile
+from app.models.slack_workspace import SlackWorkspace
+from app.models.tabular import TabularCellCitation, TabularExecution
+from app.models.team import Team, TeamMember
+from app.models.teams_tenant import TeamsTenant
+from app.models.tool_call_log import ToolCallLog
+from app.models.tool_egress import ToolEgressLog
+from app.models.user import User, UserSession
+from app.models.user_export import UserExportJob
+from app.models.user_skill import UserSkill
+from app.models.work_product import WorkProductAttribution
+from app.models.work_product_fiduciary_gate import WorkProductFiduciaryGate
+
+__all__ = [
+    "AuditLog",
+    "AuthorityTextCache",
+    "AutonomousMemory",
+    "AutonomousNotification",
+    "AutonomousSchedule",
+    "AutonomousSession",
+    "AutonomousWatch",
+    "Chat",
+    "ChatPendingToolCall",
+    "CitationLedgerEntry",
+    "CitationTreatment",
+    "CitationTreatmentSignal",
+    "Document",
+    "DocumentChunk",
+    "EnhancePromptInteraction",
+    "File",
+    "InferenceRoutingLog",
+    "KnowledgeBase",
+    "KnowledgeBaseFile",
+    "MCPOAuthState",
+    "MCPOAuthToken",
+    "MCPToolCache",
+    "Message",
+    "MessageAuthorityCitation",
+    "MessageCaselawCitation",
+    "MessageToolSource",
+    "OrchestrationAccount",
+    "OrchestrationAdmission",
+    "OrchestrationEffect",
+    "OrchestrationFile",
+    "OrchestrationPlan",
+    "OrchestrationRoot",
+    "OrganizationProfile",
+    "Playbook",
+    "PlaybookExecution",
+    "PlaybookPosition",
+    "PrecedentEntry",
+    "Project",
+    "ProjectFile",
+    "ProjectKnowledgeBase",
+    "ProjectMember",
+    "ProjectSkill",
+    "ResearchClusterMetadata",
+    "ResearchOpinionMetadata",
+    "SavedPrompt",
+    "SkillWorkspace",
+    "SkillWorkspaceFile",
+    "SlackWorkspace",
+    "TabularCellCitation",
+    "TabularExecution",
+    "Team",
+    "TeamMember",
+    "TeamsTenant",
+    "ToolCallLog",
+    "ToolEgressLog",
+    "User",
+    "UserExportJob",
+    "UserSession",
+    "UserSkill",
+    "WorkProductAttribution",
+    "WorkProductFiduciaryGate",
+]
+
+from .storage_deletion import StorageDeletion as StorageDeletion

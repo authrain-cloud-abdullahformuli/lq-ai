@@ -1,0 +1,425 @@
+"""OpenAPI surface tests.
+
+The OpenAPI sketch at `docs/api/backend-openapi.yaml` is the contract.
+Task A4 registers every path from the sketch as a 501-returning stub so
+the OpenAPI document FastAPI generates matches the contract from day
+one. This test pins that match.
+
+When the sketch is updated, this test should be updated in the same PR.
+"""
+
+from __future__ import annotations
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from app.main import app
+
+EXPECTED_PATHS: frozenset[str] = frozenset(
+    {
+        # auth
+        "/api/v1/auth/login",
+        "/api/v1/auth/logout",
+        "/api/v1/auth/refresh",
+        "/api/v1/auth/mfa/setup",
+        "/api/v1/auth/mfa/verify",
+        # D5 — MFA enrollment + verification
+        "/api/v1/auth/mfa/enable",
+        "/api/v1/auth/mfa/disable",
+        "/api/v1/auth/change-password",  # B2
+        # users
+        "/api/v1/users/me",
+        "/api/v1/users/me/export",
+        # D6 — status-poll for queued export jobs (extends the sketch).
+        "/api/v1/users/me/export/{job_id}",
+        "/api/v1/users/me/delete",
+        # D6 — cancel a pending account deletion (extends the sketch).
+        "/api/v1/users/me/delete/cancel",
+        # projects
+        "/api/v1/projects",
+        "/api/v1/projects/{project_id}",
+        "/api/v1/projects/{project_id}/skills",
+        # C7 — detach skill by name (extends the sketch).
+        "/api/v1/projects/{project_id}/skills/{skill_name}",
+        "/api/v1/projects/{project_id}/files",
+        # C7 — detach file by id (extends the sketch).
+        "/api/v1/projects/{project_id}/files/{file_id}",
+        # Wave D.1 T3 — matter <-> KB attach/detach (extends the sketch).
+        "/api/v1/projects/{project_id}/knowledge-bases",
+        "/api/v1/projects/{project_id}/knowledge-bases/{kb_id}",
+        # Migration 0067 — the matter roster (extends the sketch).
+        "/api/v1/projects/{project_id}/members",
+        "/api/v1/projects/{project_id}/members/{user_id}",
+        "/api/v1/projects/{project_id}/access",
+        # chats + messages
+        "/api/v1/chats",
+        "/api/v1/chats/{chat_id}",
+        "/api/v1/chats/{chat_id}/messages",
+        "/api/v1/chats/{chat_id}/messages/{message_id}/citations",
+        "/api/v1/chats/{chat_id}/messages/{message_id}/sources",
+        "/api/v1/chats/{chat_id}/ledger",
+        # skills
+        "/api/v1/skills",
+        "/api/v1/skills/{skill_name}",
+        "/api/v1/skills/{skill_name}/fork",
+        # internal (gateway → backend, ADR 0006 / C2)
+        "/api/v1/internal/skills/{skill_name}",
+        # D4-coverage — gateway-facing Organization Profile fetch
+        "/api/v1/internal/organization-profile",
+        # files
+        "/api/v1/files",
+        "/api/v1/files/{file_id}",
+        "/api/v1/files/{file_id}/content",
+        # knowledge bases (C6)
+        "/api/v1/knowledge-bases",
+        "/api/v1/knowledge-bases/{kb_id}",
+        "/api/v1/knowledge-bases/{kb_id}/files",
+        "/api/v1/knowledge-bases/{kb_id}/files/{file_id}",
+        "/api/v1/knowledge-bases/{kb_id}/query",
+        # organization profile
+        "/api/v1/organization-profile",
+        # D4 — convenience text/markdown endpoint (extends the sketch).
+        "/api/v1/organization-profile/raw",
+        # saved prompts
+        "/api/v1/saved-prompts",
+        "/api/v1/saved-prompts/{prompt_id}",
+        # user skills (D8 — DB-backed user-scope skills per ADR 0012)
+        "/api/v1/user-skills",
+        "/api/v1/user-skills/{skill_id}",
+        # Wave D.2 — version audit feed + slash_alias autocomplete
+        "/api/v1/user-skills/{skill_id}/versions",
+        "/api/v1/skills/autocomplete",
+        # Wave D.2 Task 2.2 — sandbox matter find-or-create
+        "/api/v1/projects/sandbox/ensure",
+        # teams (D8.1a — admin CRUD + user-facing read)
+        "/api/v1/teams",
+        "/api/v1/teams/{team_id}",
+        "/api/v1/admin/teams",
+        "/api/v1/admin/teams/{team_id}",
+        "/api/v1/admin/teams/{team_id}/members",
+        "/api/v1/admin/teams/{team_id}/members/{user_id}",
+        # Wave A — skill inspection (PRD §3.4) + Enhance Prompt (PRD §3.2)
+        "/api/v1/skills/{skill_name}/contents",
+        "/api/v1/skills/{skill_name}/inputs",
+        "/api/v1/enhance-prompt",
+        "/api/v1/enhance-prompt/{interaction_id}",
+        # Wave A — user preferences (reasoning_visibility per PRD §3.2)
+        "/api/v1/users/me/preferences",
+        # Wave B — tier inquiry (PRD §3.13) + cost dashboard (PRD §5.5) + chat search (PRD §1.7)
+        "/api/v1/inference/current-tier",
+        "/api/v1/inference/tier-config",
+        "/api/v1/admin/usage",
+        "/api/v1/chats/search",
+        # Wave C — RBAC role updates (PRD §5.2)
+        "/api/v1/admin/users/{user_id}/role",
+        # Wave B v2 — admin user list for DevRoleManagementCard
+        "/api/v1/admin/users",
+        # User provisioning — reset a user's password (extends the sketch).
+        "/api/v1/admin/users/{user_id}/reset-password",
+        # People-picker source for the matter roster (extends the sketch).
+        "/api/v1/users/directory",
+        "/api/v1/admin/matters",
+        "/api/v1/admin/matters/{project_id}/members",
+        "/api/v1/admin/matters/{project_id}/policy",
+        "/api/v1/admin/matters/{project_id}/transfer",
+        # admin
+        "/api/v1/admin/audit-log",
+        "/api/v1/admin/tier-policy",
+        # M3-0.1 / DE-283 — unauthenticated fresh-install state probe
+        "/api/v1/admin/bootstrap-status",
+        # M3-0.3 / DE-276 — admin ingest-health aggregate
+        "/api/v1/admin/ingest-health",
+        # M3-B1 — Word add-in manifest generation (admin-only sideload helper)
+        "/api/v1/admin/word-addin/manifest",
+        # M3-B8 — Word add-in version handshake (unauthenticated)
+        "/api/v1/word-addin/version",
+        # M3-A2 — Playbook executor surface
+        "/api/v1/playbooks/{playbook_id}/execute",
+        "/api/v1/playbook-executions/{execution_id}",
+        # M3-A4 — Playbook list + detail
+        "/api/v1/playbooks",
+        "/api/v1/playbooks/{playbook_id}",
+        # M3-A6 — Easy Playbook wizard endpoints (Phase 5)
+        "/api/v1/playbooks/easy",
+        "/api/v1/playbooks/easy/{generation_id}",
+        # D0.5 — model alias admin
+        "/api/v1/admin/config",
+        "/api/v1/admin/aliases",
+        "/api/v1/admin/aliases/{name}",
+        # Donna #7 — runtime provider-key (BYOK) admin proxy
+        "/api/v1/admin/provider-keys",
+        "/api/v1/admin/provider-keys/{provider}",
+        # Donna #3 — runtime tool/authority-provider admin proxy
+        "/api/v1/admin/tool-providers",
+        "/api/v1/admin/tool-providers/{provider_type}",
+        # D0 — model availability proxy
+        "/api/v1/models",
+        # Wave D.1 T4 — admin tier-floor override re-run
+        "/api/v1/inference/override-tier-floor",
+        # Wave D.1 T5 — chat receipts (replay-at-read event log)
+        "/api/v1/chats/{chat_id}/receipts",
+        # Wave D.1 T6 — chat receipts JSONL export
+        "/api/v1/chats/{chat_id}/receipts/export.jsonl",
+        # M3-C2 — Tabular / Multi-Document Review surface
+        "/api/v1/tabular/preview-cost",
+        "/api/v1/tabular/execute",
+        "/api/v1/tabular/executions",
+        "/api/v1/tabular/executions/{execution_id}",
+        "/api/v1/tabular/executions/{execution_id}/cancel",
+        # M3-C4a — XLSX/CSV export.
+        "/api/v1/tabular/executions/{execution_id}/export",
+        # DE-304 / ADR 0040 — bulk operations (preview + create).
+        "/api/v1/tabular/executions/{execution_id}/bulk-ops/preview-cost",
+        "/api/v1/tabular/executions/{execution_id}/bulk-ops",
+        "/api/v1/tabular/bulk-ops",
+        "/api/v1/tabular/bulk-ops/{bulk_op_id}",
+        # M3-D1 — slack-bridge persistence surface (bearer-token, no user)
+        "/api/v1/integrations/slack/workspaces",
+        # M3-D3 — teams-bridge persistence surface (bearer-token, no user)
+        "/api/v1/integrations/teams/tenants",
+        # M3-D4 — admin intake-bridges surface (admin-only)
+        "/api/v1/admin/intake-bridges",
+        "/api/v1/admin/intake-bridges/slack/{workspace_id}",
+        "/api/v1/admin/intake-bridges/teams/{tenant_id}",
+        # 3.8 / DE-263 — admin community-skill installer (ADR 0041)
+        "/api/v1/admin/community-skills",
+        "/api/v1/admin/community-skills/{slug}",
+        "/api/v1/admin/community-skills/{slug}/install",
+        # M4-A4-i — Autonomous sessions read/halt API (per-user)
+        "/api/v1/autonomous/sessions",
+        "/api/v1/autonomous/sessions/{session_id}",
+        "/api/v1/autonomous/sessions/{session_id}/halt",
+        # Findings read-model — a run's persisted findings (work-product)
+        "/api/v1/autonomous/sessions/{session_id}/findings",
+        # Artifacts read-model — a run's document-grade artifact refs (Donna #8)
+        "/api/v1/autonomous/sessions/{session_id}/artifacts",
+        # WS-D PR2 C5 — session citation ledger + fiduciary gate
+        "/api/v1/autonomous/sessions/{session_id}/ledger",
+        # M4-B1 — per-user memory curation API (list, keep, dismiss, delete)
+        "/api/v1/autonomous/memory",
+        "/api/v1/autonomous/memory/{memory_id}/keep",
+        "/api/v1/autonomous/memory/{memory_id}/dismiss",
+        "/api/v1/autonomous/memory/{memory_id}",
+        # M4-B2 — precedent board + promote-to-Project proposal lifecycle
+        "/api/v1/autonomous/precedents",
+        "/api/v1/autonomous/precedents/{precedent_id}/dismiss",
+        "/api/v1/autonomous/precedents/{precedent_id}/promote",
+        "/api/v1/autonomous/project-context-proposals",
+        "/api/v1/autonomous/project-context-proposals/{proposal_id}/accept",
+        "/api/v1/autonomous/project-context-proposals/{proposal_id}/reject",
+        # M4-B3 — scheduled autonomous tasks (create/list/patch/delete)
+        "/api/v1/autonomous/schedules",
+        "/api/v1/autonomous/schedules/{schedule_id}",
+        # M4-B4 — KB-arrival watches (create/list/patch/delete)
+        "/api/v1/autonomous/watches",
+        "/api/v1/autonomous/watches/{watch_id}",
+        # M4-C1 — notification read/dismiss API (list + mark-read)
+        "/api/v1/autonomous/notifications",
+        "/api/v1/autonomous/notifications/{notification_id}/read",
+        # Phase 1 §4.4 — one-off manual session spawn (run a skill/playbook now)
+        "/api/v1/autonomous/run-now",
+        "/api/v1/autonomous/orchestration/chat-runs",
+        "/api/v1/autonomous/orchestration/chat-runs/{root_id}",
+        "/api/v1/autonomous/orchestration/chat-runs/{root_id}/halt",
+        # ADR 0038 — governed runs in chat
+        "/api/v1/autonomous/orchestration/chat-runs/{root_id}/close",
+        "/api/v1/chats/{chat_id}/run-profiles",
+        "/api/v1/chats/{chat_id}/run-documents",
+        "/api/v1/chats/{chat_id}/runs",
+        "/api/v1/admin/orchestration/profiles",
+        "/api/v1/autonomous/orchestration/{root_id}/sessions/{session_id}/trace",
+        "/api/v1/autonomous/orchestration/prompts/{family}/{name}",
+        "/api/v1/skill-workspaces",
+        "/api/v1/skill-workspaces/{workspace_id}",
+        "/api/v1/skill-workspaces/{workspace_id}/files/{name}",
+        "/api/v1/autonomous/orchestration/{root_id}/tree",
+        "/api/v1/autonomous/orchestration/{root_id}/approve",
+        "/api/v1/autonomous/orchestration/{root_id}/reject",
+        "/api/v1/autonomous/orchestration/{root_id}/halt",
+        "/api/v1/autonomous/orchestration/{root_id}/files/{session_id}/{name}",
+        # WS3b — case-law research surface
+        "/api/v1/research/capabilities",
+        "/api/v1/research/verify-citations",
+        "/api/v1/research/search",
+        "/api/v1/research/clusters/{cluster_id}",
+        "/api/v1/research/opinions/{opinion_id}",
+        "/api/v1/research/find-in-case",
+        # WS-E PR1a — content-authority source registry
+        "/api/v1/research/sources",
+        # WS2/PR4b — MCP registry admin surface
+        "/api/v1/admin/mcp",
+        "/api/v1/admin/mcp/{server}/refresh",
+        "/api/v1/admin/mcp/{server}/tools/{tool}",
+        # PR4c — per-user MCP OAuth surface
+        "/api/v1/mcp/oauth/{server}/authorize",
+        "/api/v1/mcp/oauth/{server}/callback",
+        "/api/v1/mcp/oauth/{server}/status",
+        "/api/v1/mcp/oauth/{server}",
+        # PR4d Ask 1 — per-user OAuth connections list
+        "/api/v1/mcp/oauth",
+        # PR5b Task 7 — resume pending tool call
+        "/api/v1/chats/{chat_id}/tool-calls/{pending_call_id}",
+    }
+)
+
+
+@pytest.mark.unit
+async def test_openapi_paths_match_sketch() -> None:
+    """All paths from `backend-openapi.yaml` are registered.
+
+    Counts: 30 from A4 + 1 from B2 (change-password) + 2 from C7
+    (project file/skill detach by id) = 33 total.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/openapi.json")
+
+    assert response.status_code == 200
+    spec = response.json()
+    actual = {p for p in spec["paths"] if p.startswith("/api/v1")}
+    assert actual == EXPECTED_PATHS, (
+        f"OpenAPI surface drift. Missing: {EXPECTED_PATHS - actual}, "
+        f"Extra: {actual - EXPECTED_PATHS}"
+    )
+    # 67 distinct /api/v1 paths: D0's /api/v1/models + D0.5's three admin
+    # alias endpoints + D5's two new MFA endpoints + D6's two new GDPR
+    # endpoints (status-poll for /users/me/export/{job_id} and
+    # /users/me/delete/cancel) + D4's /organization-profile/raw
+    # convenience endpoint + D4-coverage's
+    # /internal/organization-profile + D8's two /api/v1/user-skills
+    # paths + D8.1a's six teams paths + Wave A's five paths +
+    # Wave B's four paths + Wave C's /admin/users/{user_id}/role +
+    # Wave B v2's /admin/users + Wave D.1's two matter <-> KB attach/detach paths
+    # + Wave D.1 T4's /inference/override-tier-floor
+    # + Wave D.2's three paths: /user-skills/{id}/versions,
+    # /skills/autocomplete, /projects/sandbox/ensure.
+    # + M3-0.1's /admin/bootstrap-status.
+    # + M3-0.3's /admin/ingest-health.
+    # + matter membership (0067): three /projects/{id}/members|access paths,
+    #   /admin/users/{id}/reset-password, and /users/directory. Note
+    #   POST /admin/users adds a method to an existing path, so it
+    #   contributes 0 new entries here.
+    # + M3-A2's two playbook-executor endpoints.
+    # + M3-A4's two playbook list/detail endpoints.
+    # + M3-A6's Playbook CRUD adds POST/PATCH/DELETE methods on /playbooks +
+    #   /playbooks/{id} — paths already counted from M3-A4's GET endpoints, so
+    #   they contribute 0 new entries to this path-count assertion (the
+    #   method-tuple assertion in test_endpoints.py is the load-bearing check
+    #   for those).
+    # + M3-A6's two NEW paths for the Easy Playbook wizard
+    #   (POST /playbooks/easy + GET /playbooks/easy/{id}).
+    # + M3-B1's /admin/word-addin/manifest.
+    # + M3-B8's /word-addin/version.
+    # + M3-C2's five NEW paths for the Tabular surface
+    #   (/tabular/preview-cost, /tabular/execute, /tabular/executions,
+    #    /tabular/executions/{id}, /tabular/executions/{id}/cancel).
+    #   DELETE on /executions/{id} shares the GET path so it adds zero
+    #   new paths here; the method-tuple count is in test_endpoints.py.
+    # + M3-C4a's /tabular/executions/{id}/export.
+    # + M3-D1's one NEW path for the slack-bridge persistence surface
+    #   (POST /integrations/slack/workspaces). One method-tuple here;
+    #   the bridge is the sole caller so additional verbs aren't needed
+    #   in M3-D1 (uninstall comes in M3-D4 admin UI work).
+    # + M3-D3's one NEW path for the teams-bridge persistence surface
+    #   (POST /integrations/teams/tenants). Same posture as M3-D1's
+    #   slack equivalent.
+    # + M3-D4's three NEW paths for the admin intake-bridges surface
+    #   (GET /admin/intake-bridges, DELETE /admin/intake-bridges/slack/{id},
+    #   DELETE /admin/intake-bridges/teams/{id}). Admin-only.
+    # M4-A4-i adds three new paths:
+    # /api/v1/autonomous/sessions
+    # /api/v1/autonomous/sessions/{session_id}
+    # /api/v1/autonomous/sessions/{session_id}/halt
+    # M4-B1 adds four new paths:
+    # /api/v1/autonomous/memory
+    # /api/v1/autonomous/memory/{memory_id}/keep
+    # /api/v1/autonomous/memory/{memory_id}/dismiss
+    # /api/v1/autonomous/memory/{memory_id}
+    # M4-B2 adds six new paths:
+    # /api/v1/autonomous/precedents
+    # /api/v1/autonomous/precedents/{precedent_id}/dismiss
+    # /api/v1/autonomous/precedents/{precedent_id}/promote
+    # /api/v1/autonomous/project-context-proposals
+    # /api/v1/autonomous/project-context-proposals/{proposal_id}/accept
+    # /api/v1/autonomous/project-context-proposals/{proposal_id}/reject
+    # M4-B3 adds two new paths:
+    # /api/v1/autonomous/schedules
+    # /api/v1/autonomous/schedules/{schedule_id}
+    # M4-B4 adds two new paths:
+    # /api/v1/autonomous/watches
+    # /api/v1/autonomous/watches/{watch_id}
+    # M4-C1 adds two new paths:
+    # /api/v1/autonomous/notifications
+    # /api/v1/autonomous/notifications/{notification_id}/read
+    # Phase 1 §4.4 adds one new path:
+    # /api/v1/autonomous/run-now
+    # Donna #7 adds two new paths:
+    # /api/v1/admin/provider-keys
+    # /api/v1/admin/provider-keys/{provider}
+    # Findings read-model adds one new path:
+    # /api/v1/autonomous/sessions/{session_id}/findings
+    # Artifacts read-model (Donna #8) adds one new path:
+    # /api/v1/autonomous/sessions/{session_id}/artifacts
+    # WS3b-follow adds one new path (123 -> 124):
+    # /api/v1/research/capabilities
+    # WS2/PR4b adds three new paths (124 -> 127):
+    # /api/v1/admin/mcp
+    # /api/v1/admin/mcp/{server}/refresh
+    # /api/v1/admin/mcp/{server}/tools/{tool}
+    # PR4c adds four new paths (127 -> 131):
+    # /api/v1/mcp/oauth/{server}/authorize
+    # /api/v1/mcp/oauth/{server}/callback
+    # /api/v1/mcp/oauth/{server}/status
+    # /api/v1/mcp/oauth/{server}
+    # PR4d Ask 1 adds one new path (131 -> 132):
+    # /api/v1/mcp/oauth
+    # PR5b Task 7 adds one new path (132 -> 133):
+    # /api/v1/chats/{chat_id}/tool-calls/{pending_call_id}
+    # PR6c Task 4 adds one new path (133 -> 134):
+    # /api/v1/chats/{chat_id}/messages/{message_id}/sources
+    # P1-A3 adds one new path (134 -> 135):
+    # /api/v1/chats/{chat_id}/ledger
+    # WS-D PR2 C5 adds one new path (135 -> 136):
+    # /api/v1/autonomous/sessions/{session_id}/ledger
+    # WS-E PR1a adds one new path (136 -> 137):
+    # /api/v1/research/sources
+    # Donna #3 adds two new paths (137 -> 139):
+    # /api/v1/admin/tool-providers
+    # /api/v1/admin/tool-providers/{provider_type}
+    # ADR 0035 adds seven demonstration/consent/tree/file paths (139 -> 146).
+    # Optional persistent skill workspaces add three owner paths (146 -> 149).
+    # DE-304 / ADR 0040 adds four new paths (150 -> 154).
+    # 3.8 / DE-263 adds three community-skill paths (154 -> 157):
+    # /api/v1/admin/community-skills
+    # /api/v1/admin/community-skills/{slug}
+    # /api/v1/admin/community-skills/{slug}/install
+    # Admin provisioning adds the reset-password path (157 -> 158).
+    # ADR 0038 adds five paths (158 -> 163): closing an uncertain run, the chat
+    # run intake, its two composer reads, and the admin profile-registry read.
+    # ADR 0038 adds two more (163 -> 165): the owner's read of how one session
+    # of a run was set up, and the text of an engine prompt file.
+    # Matter access adds eight administration and sharing paths (165 -> 173).
+    assert len(actual) == 173
+
+
+@pytest.mark.unit
+async def test_openapi_includes_health_and_ready() -> None:
+    """Liveness and readiness are also documented in the spec."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/openapi.json")
+
+    spec = response.json()
+    assert "/health" in spec["paths"]
+    assert "/ready" in spec["paths"]
+
+
+@pytest.mark.unit
+async def test_openapi_version_is_3_1() -> None:
+    """We declare OpenAPI 3.1 — FastAPI emits this by default on recent versions."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/openapi.json")
+    spec = response.json()
+    # FastAPI >= 0.99 emits OpenAPI 3.1.x by default.
+    assert spec["openapi"].startswith("3.1.")

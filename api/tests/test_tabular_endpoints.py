@@ -1,0 +1,791 @@
+"""HTTP-level tests for navigable tabular cell citations (Donna).
+
+Exercises ``GET /api/v1/tabular/executions/{id}`` read-time enrichment:
+each synthesized cell ``Citation`` (built from the persisted
+``cited_chunk_ids``) is enriched with ``source_file_id``
+(``documents.file_id``), ``source_page`` (``document_chunks.page_start``),
+and ``source_text`` (``document_chunks.content``) so the frontend can open
+the cited source in its doc panel.
+
+Key property under test: enrichment happens at serialization time. The
+execution rows are inserted directly with the pre-change persisted shape
+(``cited_chunk_ids`` only — no navigation fields stored), simulating a
+pre-feature execution; the response must still carry the navigation fields
+with no migration / backfill / re-run.
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import uuid
+from collections.abc import AsyncIterator, Callable
+from decimal import Decimal
+from typing import Any
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+from openpyxl import load_workbook  # type: ignore[import-untyped]
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.citation.cost import invalidate_cache as invalidate_judge_cache
+from app.clients.gateway import EnsembleConfig, get_gateway_client
+from app.db.session import get_db
+from app.main import app
+from app.models.document import Document, DocumentChunk
+from app.models.file import File as FileModel
+from app.models.tabular import TabularCellCitation, TabularExecution
+from app.models.user import User
+from app.schemas.tabular import _TABULAR_CITATION_NAMESPACE
+from app.security import create_access_token, hash_password
+from app.tabular import cost as tabular_cost
+
+
+def _override_get_db(db_session: AsyncSession) -> Callable[[], AsyncIterator[AsyncSession]]:
+    async def _override() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    return _override
+
+
+@pytest_asyncio.fixture
+async def client(db_session: AsyncSession) -> AsyncIterator[AsyncClient]:
+    app.dependency_overrides[get_db] = _override_get_db(db_session)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+    app.dependency_overrides.pop(get_db, None)
+
+
+async def _make_user(db: AsyncSession) -> User:
+    u = User(
+        email=f"u-{uuid.uuid4().hex[:8]}@example.com",
+        hashed_password=hash_password("pw"),
+        is_admin=False,
+        role="member",
+        mfa_enabled=False,
+        must_change_password=False,
+    )
+    db.add(u)
+    await db.flush()
+    return u
+
+
+def _bearer(user: User) -> dict[str, str]:
+    return {
+        "Authorization": (
+            f"Bearer {create_access_token(user.id, user.email, is_admin=user.is_admin)}"
+        )
+    }
+
+
+async def _make_doc_with_chunk(
+    db: AsyncSession,
+    *,
+    owner: User,
+    content: str,
+    page_start: int | None,
+) -> tuple[Document, DocumentChunk]:
+    """Seed a File + Document(file_id) + one DocumentChunk."""
+
+    f = FileModel(
+        owner_id=owner.id,
+        filename=f"doc-{uuid.uuid4().hex[:6]}.pdf",
+        mime_type="application/pdf",
+        size_bytes=1024,
+        hash_sha256=uuid.uuid4().hex + uuid.uuid4().hex,
+        storage_path=f"tabular-citation-fixture/{uuid.uuid4()}",
+        ingestion_status="ready",
+    )
+    db.add(f)
+    await db.flush()
+    doc = Document(
+        file_id=f.id,
+        parser="pymupdf-only",
+        parser_version="pymupdf=1.27",
+        page_count=3,
+        character_count=len(content),
+        normalized_content=content,
+        was_ocrd=False,
+    )
+    db.add(doc)
+    await db.flush()
+    chunk = DocumentChunk(
+        document_id=doc.id,
+        chunk_index=0,
+        content=content,
+        page_start=page_start,
+        page_end=page_start,
+        char_offset_start=0,
+        char_offset_end=len(content),
+    )
+    db.add(chunk)
+    await db.flush()
+    return doc, chunk
+
+
+async def _insert_execution(
+    db: AsyncSession,
+    *,
+    owner: User,
+    document_ids: list[uuid.UUID],
+    rows: list[dict[str, Any]],
+    schema_version: str = "m3-c2-v1",
+) -> TabularExecution:
+    """Insert a completed execution row directly in the pre-change shape.
+
+    ``results.rows[*].cells[*]`` carry only the persisted keys (notably
+    ``cited_chunk_ids``) — no navigation fields — so the test proves
+    enrichment happens at read time, not via stored data. The default
+    ``schema_version`` is the legacy stamp (``"m3-c2-v1"``); tests
+    simulating a DE-309 minting-vintage execution pass ``"m3-c2-v2"``.
+    """
+
+    execution = TabularExecution(
+        user_id=owner.id,
+        skill_name=None,
+        status="completed",
+        document_ids=document_ids,
+        columns=[{"name": "Term", "query": "What is the term?"}],
+        results={"schema_version": schema_version, "rows": rows},
+    )
+    db.add(execution)
+    await db.flush()
+    return execution
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("format", ["csv", "xlsx"])
+@pytest.mark.parametrize("case", ["zero", "mixed", "grounded", "legacy"])
+async def test_export_citations_match_get_provenance(
+    client: AsyncClient, db_session: AsyncSession, format: str, case: str
+) -> None:
+    """Exports preserve real ids and empty cells, while genuine legacy rows keep bridges."""
+    user = await _make_user(db_session)
+    content = "Term: five (5) years. Law: the State of Delaware. Notice: ninety (90) days."
+    doc, chunk = await _make_doc_with_chunk(db_session, owner=user, content=content, page_start=1)
+    values = {"Term": "5 years", "Law": "the State of Delaware", "Notice": "90 days"}
+    grounded = {"Law"} if case == "mixed" else set(values) if case == "grounded" else set()
+    if case == "grounded":
+        values.update(Term="five (5) years", Notice="ninety (90) days")
+    cells = {
+        name: {"value": value, "cited_chunk_ids": [str(chunk.id)], "confidence": "high"}
+        for name, value in values.items()
+    }
+    execution = await _insert_execution(
+        db_session,
+        owner=user,
+        document_ids=[doc.id],
+        rows=[{"document_id": str(doc.id), "document_name": "sample.txt", "cells": cells}],
+        schema_version="m3-c2-v1" if case == "legacy" else "m3-c2-v2",
+    )
+    execution.columns = [{"name": name, "query": name} for name in values]
+    expected: dict[str, str] = {}
+    for name in grounded:
+        citation = TabularCellCitation(
+            execution_id=execution.id,
+            document_id=doc.id,
+            chunk_id=chunk.id,
+            column_name=name,
+            source_offset_start=content.index(values[name]),
+            source_offset_end=content.index(values[name]) + len(values[name]),
+            verification_method="exact_match",
+            verification_confidence=Decimal("1.00"),
+        )
+        db_session.add(citation)
+        await db_session.flush()
+        expected[name] = str(citation.id)
+    if case == "legacy":
+        bridge = str(uuid.uuid5(_TABULAR_CITATION_NAMESPACE, str(chunk.id)))
+        expected = dict.fromkeys(values, bridge)
+    await db_session.flush()
+    # Export first: a preceding GET must not be needed to repair provenance.
+    exported = await client.get(
+        f"/api/v1/tabular/executions/{execution.id}/export?format={format}", headers=_bearer(user)
+    )
+    assert exported.status_code == 200, exported.text
+    if format == "csv":
+        row = next(csv.DictReader(io.StringIO(exported.text)))
+        assert {name: row[name] for name in values} == values
+        assert row["citation_links"] == ";".join(
+            f"{name}:{expected[name]}" for name in values if name in expected
+        )
+    else:
+        sheet = load_workbook(io.BytesIO(exported.content)).active
+        assert sheet is not None
+        for index, (name, value) in enumerate(values.items(), start=2):
+            cell = sheet.cell(row=2, column=index)
+            assert cell.value == value
+            if name in expected:
+                assert cell.comment is not None
+                assert expected[name] in cell.comment.text
+            else:
+                assert cell.comment is None
+    fetched = await client.get(f"/api/v1/tabular/executions/{execution.id}", headers=_bearer(user))
+    assert fetched.status_code == 200
+    for name, cell in fetched.json()["results"]["rows"][0]["cells"].items():
+        assert [c["citation_id"] for c in cell["citations"]] == (
+            [expected[name]] if name in expected else []
+        )
+
+
+@pytest.mark.integration
+async def test_get_execution_enriches_citations_with_navigable_source(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    user = await _make_user(db_session)
+    content = "The term of this Agreement is three (3) years from the Effective Date."
+    doc, chunk = await _make_doc_with_chunk(db_session, owner=user, content=content, page_start=2)
+    execution = await _insert_execution(
+        db_session,
+        owner=user,
+        document_ids=[doc.id],
+        rows=[
+            {
+                "document_id": str(doc.id),
+                "document_name": "nda.pdf",
+                "cells": {
+                    "Term": {
+                        "value": "3 years",
+                        "cited_chunk_ids": [str(chunk.id)],
+                        "confidence": "high",
+                        "tier_used": 2,
+                    }
+                },
+            }
+        ],
+    )
+
+    resp = await client.get(f"/api/v1/tabular/executions/{execution.id}", headers=_bearer(user))
+    assert resp.status_code == 200, resp.text
+    cell = resp.json()["results"]["rows"][0]["cells"]["Term"]
+    citations = cell["citations"]
+    assert len(citations) == 1
+    cit = citations[0]
+
+    # Existing display-only fields still present.
+    assert cit["document_id"] == str(doc.id)
+    assert cit["chunk_id"] == str(chunk.id)
+    assert cit["citation_id"]  # synthetic deterministic id
+
+    # Navigation fields resolved at read time.
+    assert cit["source_file_id"] == str(doc.file_id)
+    assert cit["source_page"] == 2
+    assert cit["source_text"] == content
+
+    # The referenced file actually exists.
+    file_row = await db_session.get(FileModel, doc.file_id)
+    assert file_row is not None
+
+
+@pytest.mark.integration
+async def test_get_execution_empty_cited_chunk_ids_yields_no_citations(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Back-compat: a cell with no cited chunks → empty citations, no error."""
+
+    user = await _make_user(db_session)
+    doc, _chunk = await _make_doc_with_chunk(
+        db_session, owner=user, content="irrelevant", page_start=1
+    )
+    execution = await _insert_execution(
+        db_session,
+        owner=user,
+        document_ids=[doc.id],
+        rows=[
+            {
+                "document_id": str(doc.id),
+                "document_name": "nda.pdf",
+                "cells": {
+                    "Term": {
+                        "value": None,
+                        "cited_chunk_ids": [],
+                        "confidence": "failed",
+                        "error": "no citation found",
+                    }
+                },
+            }
+        ],
+    )
+
+    resp = await client.get(f"/api/v1/tabular/executions/{execution.id}", headers=_bearer(user))
+    assert resp.status_code == 200, resp.text
+    cell = resp.json()["results"]["rows"][0]["cells"]["Term"]
+    assert cell["citations"] == []
+
+
+@pytest.mark.integration
+async def test_get_execution_stale_chunk_id_leaves_nav_fields_null(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A cited chunk id with no backing row → nav fields stay null, no crash."""
+
+    user = await _make_user(db_session)
+    doc, _chunk = await _make_doc_with_chunk(
+        db_session, owner=user, content="present", page_start=1
+    )
+    stale_chunk_id = uuid.uuid4()  # never inserted
+    execution = await _insert_execution(
+        db_session,
+        owner=user,
+        document_ids=[doc.id],
+        rows=[
+            {
+                "document_id": str(doc.id),
+                "document_name": "nda.pdf",
+                "cells": {
+                    "Term": {
+                        "value": "x",
+                        "cited_chunk_ids": [str(stale_chunk_id)],
+                        "confidence": "low",
+                    }
+                },
+            }
+        ],
+    )
+
+    resp = await client.get(f"/api/v1/tabular/executions/{execution.id}", headers=_bearer(user))
+    assert resp.status_code == 200, resp.text
+    cit = resp.json()["results"]["rows"][0]["cells"]["Term"]["citations"][0]
+    assert cit["chunk_id"] == str(stale_chunk_id)
+    assert cit["source_file_id"] is None
+    assert cit["source_page"] is None
+    assert cit["source_text"] is None
+
+
+@pytest.mark.integration
+async def test_get_execution_batches_across_two_documents(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A cell citing two chunks across two documents resolves each correctly.
+
+    Proves the batched chunk + document IN-queries map each citation to
+    the right file / page / text (no cross-contamination).
+    """
+
+    user = await _make_user(db_session)
+    doc_a, chunk_a = await _make_doc_with_chunk(
+        db_session, owner=user, content="alpha source text", page_start=1
+    )
+    doc_b, chunk_b = await _make_doc_with_chunk(
+        db_session, owner=user, content="bravo source text", page_start=5
+    )
+    # Row is for doc_a; its cell cites a chunk from doc_a AND doc_b.
+    execution = await _insert_execution(
+        db_session,
+        owner=user,
+        document_ids=[doc_a.id, doc_b.id],
+        rows=[
+            {
+                "document_id": str(doc_a.id),
+                "document_name": "a.pdf",
+                "cells": {
+                    "Term": {
+                        "value": "cross-doc",
+                        "cited_chunk_ids": [str(chunk_a.id), str(chunk_b.id)],
+                        "confidence": "high",
+                    }
+                },
+            }
+        ],
+    )
+
+    resp = await client.get(f"/api/v1/tabular/executions/{execution.id}", headers=_bearer(user))
+    assert resp.status_code == 200, resp.text
+    citations = resp.json()["results"]["rows"][0]["cells"]["Term"]["citations"]
+    by_chunk = {c["chunk_id"]: c for c in citations}
+
+    cit_a = by_chunk[str(chunk_a.id)]
+    assert cit_a["source_file_id"] == str(doc_a.file_id)
+    assert cit_a["source_page"] == 1
+    assert cit_a["source_text"] == "alpha source text"
+
+    cit_b = by_chunk[str(chunk_b.id)]
+    assert cit_b["source_file_id"] == str(doc_b.file_id)
+    assert cit_b["source_page"] == 5
+    assert cit_b["source_text"] == "bravo source text"
+
+
+# --- DE-309: minted offset-bearing citations vs uuid5-bridge fallback -------
+
+
+@pytest.mark.integration
+async def test_get_execution_serves_minted_citations_with_offsets(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An execution with minted ``tabular_cell_citations`` rows serves
+    REAL citation ids + chunk-local offsets, and the offsets resolve
+    into the served ``source_text`` (acceptance: minted rows resolve
+    into source_text)."""
+
+    user = await _make_user(db_session)
+    content = "The term of this Agreement is five (5) years from the Effective Date."
+    value = "five (5) years"
+    start = content.index(value)
+    end = start + len(value)
+    doc, chunk = await _make_doc_with_chunk(db_session, owner=user, content=content, page_start=2)
+    execution = await _insert_execution(
+        db_session,
+        owner=user,
+        document_ids=[doc.id],
+        rows=[
+            {
+                "document_id": str(doc.id),
+                "document_name": "nda.pdf",
+                "cells": {
+                    "Term": {
+                        "value": value,
+                        "cited_chunk_ids": [str(chunk.id)],
+                        "confidence": "high",
+                        "tier_used": 2,
+                    }
+                },
+            }
+        ],
+        schema_version="m3-c2-v2",
+    )
+    minted = TabularCellCitation(
+        execution_id=execution.id,
+        document_id=doc.id,
+        column_name="Term",
+        chunk_id=chunk.id,
+        source_offset_start=start,
+        source_offset_end=end,
+        verification_method="exact_match",
+        verification_confidence=Decimal("1.00"),
+    )
+    db_session.add(minted)
+    await db_session.flush()
+
+    resp = await client.get(f"/api/v1/tabular/executions/{execution.id}", headers=_bearer(user))
+    assert resp.status_code == 200, resp.text
+    citations = resp.json()["results"]["rows"][0]["cells"]["Term"]["citations"]
+    assert len(citations) == 1
+    cit = citations[0]
+
+    # Real minted id — NOT the uuid5 bridge id.
+    assert cit["citation_id"] == str(minted.id)
+    bridge_id = str(uuid.uuid5(_TABULAR_CITATION_NAMESPACE, str(chunk.id)))
+    assert cit["citation_id"] != bridge_id
+
+    # Offsets + method/confidence from the minted row.
+    assert cit["source_offset_start"] == start
+    assert cit["source_offset_end"] == end
+    assert cit["verification_method"] == "exact_match"
+    assert cit["verification_confidence"] == 1.0
+
+    # Navigation enrichment still applies, and the offsets resolve
+    # into the served source_text.
+    assert cit["source_file_id"] == str(doc.file_id)
+    assert cit["source_page"] == 2
+    assert cit["source_text"] == content
+    assert cit["source_text"][cit["source_offset_start"] : cit["source_offset_end"]] == value
+
+
+@pytest.mark.integration
+async def test_get_execution_minted_run_ungrounded_cell_renders_unverified(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Fail-closed: in an execution that HAS minted rows, a cell the
+    locator could not ground gets an EMPTY citations list — the bridge
+    must not resurrect a synthetic citation for it."""
+
+    user = await _make_user(db_session)
+    content = "Governing law: the State of Delaware shall govern this Agreement."
+    doc, chunk = await _make_doc_with_chunk(db_session, owner=user, content=content, page_start=1)
+    execution = await _insert_execution(
+        db_session,
+        owner=user,
+        document_ids=[doc.id],
+        rows=[
+            {
+                "document_id": str(doc.id),
+                "document_name": "nda.pdf",
+                "cells": {
+                    "Law": {
+                        "value": "Delaware",
+                        "cited_chunk_ids": [str(chunk.id)],
+                        "confidence": "high",
+                    },
+                    # Paraphrased value — never located, no minted row.
+                    "Term": {
+                        "value": "5 years",
+                        "cited_chunk_ids": [str(chunk.id)],
+                        "confidence": "medium",
+                    },
+                },
+            }
+        ],
+        schema_version="m3-c2-v2",
+    )
+    start = content.index("Delaware")
+    db_session.add(
+        TabularCellCitation(
+            execution_id=execution.id,
+            document_id=doc.id,
+            column_name="Law",
+            chunk_id=chunk.id,
+            source_offset_start=start,
+            source_offset_end=start + len("Delaware"),
+            verification_method="exact_match",
+            verification_confidence=Decimal("1.00"),
+        )
+    )
+    await db_session.flush()
+
+    resp = await client.get(f"/api/v1/tabular/executions/{execution.id}", headers=_bearer(user))
+    assert resp.status_code == 200, resp.text
+    cells = resp.json()["results"]["rows"][0]["cells"]
+
+    assert len(cells["Law"]["citations"]) == 1
+    # The ungrounded cell renders unverified — no bridge fallback here.
+    assert cells["Term"]["citations"] == []
+
+
+@pytest.mark.integration
+async def test_get_execution_without_minted_rows_falls_back_to_bridge(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Back-compat: an execution predating migration 0079 (no minted
+    rows at all) keeps the deterministic uuid5-bridge citations, with
+    no offset fields."""
+
+    user = await _make_user(db_session)
+    content = "Assignment requires prior written consent."
+    doc, chunk = await _make_doc_with_chunk(db_session, owner=user, content=content, page_start=1)
+    execution = await _insert_execution(
+        db_session,
+        owner=user,
+        document_ids=[doc.id],
+        rows=[
+            {
+                "document_id": str(doc.id),
+                "document_name": "nda.pdf",
+                "cells": {
+                    "Assignment": {
+                        "value": "consent required",
+                        "cited_chunk_ids": [str(chunk.id)],
+                        "confidence": "medium",
+                    }
+                },
+            }
+        ],
+    )
+
+    resp = await client.get(f"/api/v1/tabular/executions/{execution.id}", headers=_bearer(user))
+    assert resp.status_code == 200, resp.text
+    cit = resp.json()["results"]["rows"][0]["cells"]["Assignment"]["citations"][0]
+
+    assert cit["citation_id"] == str(uuid.uuid5(_TABULAR_CITATION_NAMESPACE, str(chunk.id)))
+    assert cit["source_offset_start"] is None
+    assert cit["source_offset_end"] is None
+    assert cit["verification_confidence"] is None
+    # Navigation enrichment still fires for bridge citations.
+    assert cit["source_text"] == content
+
+
+@pytest.mark.integration
+async def test_get_execution_minting_vintage_zero_minted_rows_fails_closed(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Fail-closed keys off execution VINTAGE, not minted-row count
+    (DE-309): an execution produced by the minting aggregate node
+    (``schema_version == "m3-c2-v2"``) where the locator grounded
+    NOTHING — zero ``tabular_cell_citations`` rows anywhere — must
+    serve an empty citations list for the cell: no uuid5-bridge
+    citation, no ``source_text`` leak, no verification badge."""
+
+    user = await _make_user(db_session)
+    content = "Termination requires ninety (90) days prior written notice."
+    doc, chunk = await _make_doc_with_chunk(db_session, owner=user, content=content, page_start=1)
+    execution = await _insert_execution(
+        db_session,
+        owner=user,
+        document_ids=[doc.id],
+        rows=[
+            {
+                "document_id": str(doc.id),
+                "document_name": "nda.pdf",
+                "cells": {
+                    # Paraphrased value — never located; the execution
+                    # minted zero rows in total.
+                    "Term": {
+                        "value": "90 days",
+                        "cited_chunk_ids": [str(chunk.id)],
+                        "confidence": "medium",
+                    }
+                },
+            }
+        ],
+        schema_version="m3-c2-v2",
+    )
+
+    resp = await client.get(f"/api/v1/tabular/executions/{execution.id}", headers=_bearer(user))
+    assert resp.status_code == 200, resp.text
+    cell = resp.json()["results"]["rows"][0]["cells"]["Term"]
+    assert cell["citations"] == []
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("schema_version", ["m3-c2-v1", "m3-c2-v2"])
+@pytest.mark.parametrize("has_minted_row", [False, True])
+async def test_cancel_partial_grid_preserves_citation_vintage(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    schema_version: str,
+    has_minted_row: bool,
+) -> None:
+    """Cancel and subsequent GET agree for legacy, zero-minted and mixed grids."""
+
+    user = await _make_user(db_session)
+    content = "The term is five (5) years."
+    doc, chunk = await _make_doc_with_chunk(db_session, owner=user, content=content, page_start=1)
+    execution = await _insert_execution(
+        db_session,
+        owner=user,
+        document_ids=[doc.id],
+        schema_version=schema_version,
+        rows=[
+            {
+                "document_id": str(doc.id),
+                "document_name": "nda.pdf",
+                "cells": {
+                    "Term": {
+                        "value": "five (5) years",
+                        "cited_chunk_ids": [str(chunk.id)],
+                        "confidence": "high",
+                    },
+                    "Unlocated": {
+                        "value": "5 years",
+                        "cited_chunk_ids": [str(chunk.id)],
+                        "confidence": "medium",
+                    },
+                },
+            }
+        ],
+    )
+    execution.status = "running"
+    citation_id = uuid.uuid4()
+    if has_minted_row:
+        start = content.index("five (5) years")
+        db_session.add(
+            TabularCellCitation(
+                id=citation_id,
+                execution_id=execution.id,
+                document_id=doc.id,
+                column_name="Term",
+                chunk_id=chunk.id,
+                source_offset_start=start,
+                source_offset_end=start + len("five (5) years"),
+                verification_method="exact_match",
+                verification_confidence=Decimal("1.00"),
+            )
+        )
+    await db_session.flush()
+
+    cancelled = await client.post(
+        f"/api/v1/tabular/executions/{execution.id}/cancel", headers=_bearer(user)
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+    fetched = await client.get(f"/api/v1/tabular/executions/{execution.id}", headers=_bearer(user))
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["results"] == cancelled.json()["results"]
+    cells = cancelled.json()["results"]["rows"][0]["cells"]
+    if schema_version == "m3-c2-v1":
+        bridge_id = str(uuid.uuid5(_TABULAR_CITATION_NAMESPACE, str(chunk.id)))
+        assert cells["Term"]["citations"][0]["citation_id"] == bridge_id
+        assert cells["Unlocated"]["citations"][0]["citation_id"] == bridge_id
+    else:
+        assert cells["Unlocated"]["citations"] == []
+        if has_minted_row:
+            assert [c["citation_id"] for c in cells["Term"]["citations"]] == [str(citation_id)]
+        else:
+            assert cells["Term"]["citations"] == []
+
+
+# --- preview-cost: ensemble premium surface (Donna #6) ----------------------
+
+
+class _StubGateway:
+    """Minimal gateway stub for preview-cost — only the ensemble-config
+    accessor the endpoint touches is implemented."""
+
+    def __init__(self, ensemble_config: EnsembleConfig | None) -> None:
+        self._ensemble_config = ensemble_config
+
+    async def get_citation_engine_ensemble_config(self) -> EnsembleConfig | None:
+        return self._ensemble_config
+
+
+@pytest.mark.asyncio
+async def test_preview_cost_no_ensemble_config_back_compat(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """With no ensemble configured, the new fields are present and zero —
+    the back-compat shape the UI relies on when the gateway has no
+    ensemble. (The premium math itself is unit-tested in
+    tests/tabular/test_cost.py.)"""
+
+    user = await _make_user(db_session)
+    app.dependency_overrides[get_gateway_client] = lambda: _StubGateway(None)
+    tabular_cost.invalidate_cache()
+    invalidate_judge_cache()
+    try:
+        resp = await client.post(
+            "/api/v1/tabular/preview-cost",
+            headers=_bearer(user),
+            json={
+                "document_ids": [str(uuid.uuid4()) for _ in range(2)],
+                "columns": [
+                    {"name": "A", "query": "?", "ensemble_verification": True},
+                ],
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_gateway_client, None)
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["ensemble_cells_count"] == 0
+    assert payload["ensemble_premium_usd"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_preview_cost_ensemble_premium_applied(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An ensemble-verified column drives a positive premium through the
+    endpoint when the gateway returns an ensemble config."""
+
+    user = await _make_user(db_session)
+    config = EnsembleConfig(
+        default_enabled=False,
+        judge_models=("a", "b", "c"),
+        aggregation_rule="strict",
+        max_cost_per_message_usd=1.0,
+        envelope_tier=3,
+    )
+    app.dependency_overrides[get_gateway_client] = lambda: _StubGateway(config)
+    tabular_cost.invalidate_cache()
+    invalidate_judge_cache()
+    try:
+        resp = await client.post(
+            "/api/v1/tabular/preview-cost",
+            headers=_bearer(user),
+            json={
+                "document_ids": [str(uuid.uuid4()) for _ in range(3)],
+                "columns": [
+                    {"name": "A", "query": "?", "ensemble_verification": True},
+                ],
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_gateway_client, None)
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    # 3 docs * 1 ensemble column = 3 ensemble cells.
+    assert payload["ensemble_cells_count"] == 3
+    assert float(payload["ensemble_premium_usd"]) > 0

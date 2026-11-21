@@ -1,0 +1,232 @@
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
+import { join } from 'node:path'
+import { composeBaseArgs, logsArgs } from '../core/compose'
+import { resolvePorts } from '../core/ports'
+import { generateSecrets } from '../core/secrets'
+import { DEFAULT_PORTS } from '../core/types'
+import type { LauncherConfig } from '../core/config'
+import {
+	loadConfig,
+	saveConfig,
+	writeEnvFile,
+	clearConfig,
+	ensureMasterKey,
+	ensureObjectStoreConfig
+} from './store'
+import { composeFilePath, envPath, PROJECT_NAME } from './paths'
+import {
+	snapshot,
+	startStackWithMigrations,
+	stopStack,
+	resetStack,
+	runAdminFixture,
+	migrationStatus,
+	rollbackMigration,
+	type MigrationPlan,
+	type StackSnapshot
+} from './orchestrator'
+import { streamDocker } from './runner'
+import { isPortFreeSync } from './netcheck'
+
+let win: BrowserWindow | null = null
+
+declare const __LQ_AI_RELEASE_IMAGE_TAG__: string
+
+/** Compose base args, including the app-data --env-file so the generated .env is used. */
+const base = (): string[] => [
+	...composeBaseArgs(composeFilePath(), PROJECT_NAME),
+	'--env-file',
+	envPath()
+]
+
+interface WizardInput {
+	adminEmail: string
+	adminPassword: string
+	/** Optional provider key (sk-ant-… → Anthropic, else OpenAI). Written to .env, never persisted. */
+	providerKey?: string
+}
+
+function createWindow(): void {
+	win = new BrowserWindow({
+		width: 1100,
+		height: 760,
+		webPreferences: {
+			preload: join(__dirname, '../preload/index.mjs'),
+			// contextIsolation stays on (Electron default) — the security boundary.
+			// sandbox is false because electron-vite emits an ESM preload (.mjs), which
+			// sandboxed preloads cannot load. contextIsolation (on) is the real boundary.
+			sandbox: false
+		}
+	})
+	if (process.env.ELECTRON_RENDERER_URL) win.loadURL(process.env.ELECTRON_RENDERER_URL)
+	else win.loadFile(join(__dirname, '../renderer/index.html'))
+}
+
+async function waitHealthy(b: string[], timeoutMs = 600_000): Promise<void> {
+	const started = Date.now()
+	while (Date.now() - started < timeoutMs) {
+		const snap: StackSnapshot = await snapshot(b)
+		win?.webContents.send('stack:state', snap)
+		if (snap.state === 'HEALTHY') return
+		if (snap.state === 'FAILED') throw new Error('Stack failed to start; see logs.')
+		if (snap.state === 'NO_ENGINE')
+			throw new Error(
+				snap.engineMessage ?? "Docker isn't running. Start Docker Desktop and try again."
+			)
+		await new Promise((r) => setTimeout(r, 4000))
+	}
+	throw new Error('Timed out waiting for the stack to become healthy.')
+}
+
+async function confirmMigration(plan: MigrationPlan): Promise<boolean> {
+	const facts = plan.detection.facts ?? {}
+	const size =
+		typeof facts.volume_bytes === 'number' ? `${facts.volume_bytes} bytes` : 'unknown size'
+	const count =
+		typeof facts.object_count === 'number' ? `${facts.object_count} objects` : 'unknown count'
+	const snapshotSpace = plan.checks?.find((check) => check.name === 'snapshot-space')?.message
+	const result = await dialog.showMessageBox(win!, {
+		type: 'warning',
+		title: plan.title ?? 'LQ.AI storage upgrade',
+		message: 'LQ.AI must snapshot and migrate its object store before it can start.',
+		detail: `${plan.reason}\n\nDetected: ${count}, ${size}.\nSnapshot: ${snapshotSpace ?? 'destination availability unknown'}.\nThe snapshot is retained until you remove it.`,
+		buttons: ['Snapshot and continue', 'Cancel'],
+		defaultId: 0,
+		cancelId: 1,
+		noLink: true
+	})
+	return result.response === 0
+}
+
+async function startWithMigrations(b: string[]): Promise<void> {
+	const result = await startStackWithMigrations(b, process.env, confirmMigration, (message) =>
+		win?.webContents.send('stack:log', `[migration] ${message}`)
+	)
+	if (result.code !== 0) throw new Error(result.stderr || 'Stack start was cancelled.')
+}
+
+ipcMain.handle('config:isFirstRun', () => loadConfig() === null)
+
+ipcMain.handle('wizard:complete', async (_e, input: WizardInput) => {
+	try {
+		if (typeof input?.adminEmail !== 'string' || typeof input?.adminPassword !== 'string') {
+			return { ok: false, error: 'Invalid setup input.' }
+		}
+		// Optional provider key: must be a single token if present (renderEnv drops malformed
+		// values defensively, but reject here so a bad paste surfaces as a clear error).
+		const providerKey =
+			typeof input.providerKey === 'string' && input.providerKey.trim()
+				? input.providerKey.trim()
+				: undefined
+		if (providerKey && /\s/.test(providerKey)) {
+			return {
+				ok: false,
+				error: 'Provider key contains whitespace — paste just the key.'
+			}
+		}
+		// Anthropic + OpenAI keys both start with "sk-"; reject other shapes so a wrong
+		// paste isn't silently written as OPENAI_API_KEY (providerKeyVar's default branch).
+		if (providerKey && !providerKey.startsWith('sk-')) {
+			return {
+				ok: false,
+				error: 'That key should start with "sk-" (Anthropic or OpenAI).'
+			}
+		}
+		const cfg: LauncherConfig = {
+			secrets: generateSecrets(),
+			ports: resolvePorts(DEFAULT_PORTS, isPortFreeSync),
+			// Release builds bake desktop-vX.Y.Z -> vX.Y.Z; local builds retain latest.
+			imageTag: __LQ_AI_RELEASE_IMAGE_TAG__,
+			imageNamespace: 'legalquants',
+			adminEmail: input.adminEmail,
+			providerKey
+		}
+		// Write the .env (needed before startStack) but DON'T persist the config blob yet —
+		// only mark the wizard complete after the stack is healthy and the admin exists, so a
+		// failed first run re-shows the wizard instead of stranding a half-configured install.
+		writeEnvFile(cfg)
+		const b = base()
+		// A prior failed first-run attempt can leave an orphaned postgres volume
+		// initialized with a now-discarded password (we regenerate secrets each
+		// wizard run, and POSTGRES only honors the password on first init of an
+		// empty volume). Without this, the second attempt's fresh secrets meet
+		// the old volume → api "password authentication failed" crash-loop. Since
+		// the wizard only runs on first-run (no persisted config), wiping volumes
+		// here is safe and guarantees fresh secrets meet a fresh postgres init.
+		await resetStack(b)
+		await startWithMigrations(b)
+		await waitHealthy(b)
+		const admin = await runAdminFixture(b, input.adminEmail, input.adminPassword)
+		if (admin.code !== 0) {
+			throw new Error(
+				`Could not set up the login: ${admin.stderr.trim() || admin.stdout.trim() || 'admin fixture failed'}`
+			)
+		}
+		// Persist everything EXCEPT the provider key — it's already written to the .env;
+		// keeping it out of the config blob matches the store.ts BYOK note (provider keys
+		// are not persisted here) and avoids a second at-rest copy.
+		saveConfig({ ...cfg, providerKey: undefined })
+		return { ok: true }
+	} catch (err) {
+		return { ok: false, error: String(err) }
+	}
+})
+
+ipcMain.handle('stack:status', () => snapshot(base()))
+ipcMain.handle('stack:start', () => startWithMigrations(base()))
+ipcMain.handle('stack:migrationStatus', () => migrationStatus(base(), process.env))
+ipcMain.handle('stack:rollbackMigration', async () => {
+	const confirmation = await dialog.showMessageBox(win!, {
+		type: 'warning',
+		title: 'Roll back object-store migration',
+		message: 'Stop LQ.AI and restore the latest journalled MinIO snapshot?',
+		detail:
+			'This replaces the current object-store volume. Afterward, install the previous LQ.AI release and start it with the cached MinIO image.',
+		buttons: ['Restore snapshot', 'Cancel'],
+		defaultId: 1,
+		cancelId: 1,
+		noLink: true
+	})
+	if (confirmation.response !== 0) {
+		return { code: 50, stdout: '', stderr: 'Rollback cancelled.' }
+	}
+	return rollbackMigration(base(), process.env)
+})
+ipcMain.handle('stack:stop', () => stopStack(base()))
+ipcMain.handle('stack:openWeb', () => {
+	const cfg = loadConfig()
+	const port = cfg?.ports.web ?? DEFAULT_PORTS.web
+	win?.loadURL(`http://localhost:${port}`)
+})
+// Reset: stop the stack, remove its volumes (down -v), and delete the stored config/.env
+// so the next launch re-runs the first-run wizard. down -v runs while .env still exists.
+ipcMain.handle('stack:reset', async () => {
+	try {
+		await resetStack(base())
+		clearConfig()
+		return { ok: true }
+	} catch (err) {
+		return { ok: false, error: String(err) }
+	}
+})
+ipcMain.handle('engine:installDocker', () =>
+	// Direct Apple-Silicon Docker Desktop download (this launcher is arm64-only).
+	shell.openExternal('https://desktop.docker.com/mac/main/arm64/Docker.dmg')
+)
+
+app.whenReady().then(() => {
+	ensureObjectStoreConfig(__LQ_AI_RELEASE_IMAGE_TAG__)
+	// Backfill the BYOK master key into installs that predate it, before the
+	// renderer can trigger a stack start (no-op on first run / already-migrated).
+	ensureMasterKey()
+	createWindow()
+	// Tail web logs into the renderer (best-effort; ignored before the stack exists).
+	const stopLogTail = streamDocker(logsArgs(base(), 'web'), (line) =>
+		win?.webContents.send('stack:log', line)
+	)
+	app.on('before-quit', stopLogTail)
+})
+
+app.on('window-all-closed', () => {
+	if (process.platform !== 'darwin') app.quit()
+})

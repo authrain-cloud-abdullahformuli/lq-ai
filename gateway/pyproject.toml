@@ -1,0 +1,167 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lq-ai-gateway"
+version = "0.1.0"
+description = "LQ.AI Inference Gateway — the security boundary for LLM provider access"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "LegalQuants" }]
+dependencies = [
+    "fastapi>=0.141.1,<0.146",
+    "uvicorn[standard]>=0.52.1,<0.55",
+    "pydantic>=2.7,<3",
+    "pydantic-settings>=2.4,<3",
+    "pyyaml>=6.0",
+    # B3: provider adapters use httpx.AsyncClient for outbound calls.
+    # No `anthropic` SDK — PRD §4 calls for hand-rolled gateway code in
+    # lieu of LLM-SDK dependencies, to keep the supply-chain surface honest.
+    "httpx>=0.27,<0.29",
+    # B4: the router writes one row to inference_routing_log per routed
+    # request (the Tier-Derivation choke point per PRD §3.13 / §1.5.2).
+    # SQLAlchemy 2.x async engine + asyncpg as the driver — same versions
+    # api/ pins so a multi-service deployment doesn't end up with two
+    # asyncpg ABIs in one container image. greenlet is a SQLAlchemy
+    # transitive that pip resolves automatically; pinned here so the
+    # SBOM is honest about it.
+    "sqlalchemy[asyncio]>=2.0.51,<2.2",
+    "asyncpg>=0.31.0,<0.33",
+    "greenlet>=3.0,<4",
+    # ADR 0011: encrypted-at-rest provider keys via Fernet (AES-128-CBC +
+    # HMAC-SHA256). The cryptography library is the standard Python AEAD
+    # implementation; stdlib stops at hashlib/hmac. Master key is supplied
+    # by the operator at gateway startup via LQ_AI_GATEWAY_MASTER_KEY;
+    # individual provider keys live encrypted in gateway.yaml under
+    # api_key_encrypted: <fernet-token>.
+    "cryptography>=50.0.0,<51",
+    # M-Obs.1 — Prometheus /metrics (PRD §5.4). The official client
+    # exposes a stdlib-only counter/histogram/gauge API plus an ASGI
+    # app for mounting at /metrics. Small, BSD-licensed, no transitive
+    # deps. The deployment scrapes /metrics from operator infra
+    # (Prometheus, Grafana Agent, Vector, etc.).
+    "prometheus-client>=0.20,<1",
+    # M-Obs.1 — OpenTelemetry instrumentation (PRD §5.4). The
+    # operator gets distributed traces spanning api → gateway →
+    # provider with standard W3C propagation. SDK is dormant unless
+    # OTEL_EXPORTER_OTLP_ENDPOINT is set — that's the "no telemetry
+    # by default" guarantee in PRD §5.7. Apache-2.0 across the OTel
+    # family. The pin-floor matches the OTel stable-API minor that
+    # ships the Python `metrics` API as stable.
+    "opentelemetry-api>=1.27,<2",
+    "opentelemetry-sdk>=1.27,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.27,<2",
+    "opentelemetry-instrumentation-fastapi>=0.48b0,<1",
+    "opentelemetry-instrumentation-httpx>=0.48b0,<1",
+    # M2-A3 (PRD §4.7) — Anonymization Layer. Presidio is Microsoft's PII
+    # detection/redaction framework; we use it for entity recognition
+    # (analyzer) and pseudonym substitution (anonymizer). spaCy is the
+    # NLP backbone presidio-analyzer ships with by default; we pull
+    # ``en_core_web_lg`` in M2-B2 when custom legal recognizers land.
+    # M2-A3 itself only loads the PseudonymMapper (in-process counter,
+    # no spaCy/presidio runtime use); the heavy import path is deferred
+    # to M2-B3 middleware integration.
+    "presidio-analyzer~=2.2",
+    "presidio-anonymizer~=2.2",
+    "spacy~=3.8",
+    # WS2/PR4a — Model Context Protocol client. The gateway is the sole egress
+    # and the only MCP-protocol speaker (ADR 0014 + spec D1): streamable_http
+    # sessions are stateful, so the connection holder must speak MCP. This is
+    # the official MCP SDK — not reasonably hand-rollable (it implements the
+    # full JSON-RPC-over-SSE session + auth handshake). Client-only use here.
+    # Floor 1.30: earlier 1.x follows a server's cross-origin redirect
+    # (GHSA-5h93-6whr-6q8j) and fetches server-chosen $ref URLs while
+    # validating tool output (GHSA-rwrf-2pqf-9j8j). <2: 2.x replaces the HTTP
+    # stack and the TLS trust store, a migration still to be decided.
+    "mcp>=1.30,<2",
+    # starlette is pinned explicitly rather than left to fastapi's resolver.
+    # History: this cap was originally <1.4 because mcp pulls sse-starlette,
+    # whose 3.4.x line requires starlette 1.x, which conflicted with the
+    # starlette<0.49 pin fastapi carried at 0.116. That conflict is gone —
+    # fastapi 0.141.1 declares starlette with no version specifier, and we
+    # have been running starlette 1.x since 1.3.1. We use only the MCP
+    # *client* (ClientSession + streamablehttp_client), never the server.
+    # Moves in lockstep with api/pyproject.toml's pin — bump both together.
+    "starlette>=1.4.1,<1.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    # Coverage gate (roadmap 4.3). Enforced in CI via --cov-fail-under=88, a
+    # no-decrease ratchet at measured coverage (88.94% on 2026-07-25; the
+    # documented 90% target is not yet met — delta tracked as PRD §9 DE-387).
+    "pytest-cov>=7.1",
+    "respx>=0.21",
+    # Pinned exactly: ruff's formatter output changes across releases, so an
+    # unpinned floor let CI (which resolves latest) drift ahead of dev venvs
+    # and fail `ruff format --check` on code that was clean locally. Pin so
+    # local == CI. Bump deliberately (and reformat) when upgrading.
+    "ruff==0.17.1",
+    "mypy>=1.11",
+    "types-PyYAML>=6.0",
+    # DE-230 — property-based testing of the anonymization round-trip,
+    # streaming rehydrator, and tier-floor invariants (tests/property/).
+    # MPL-2.0, test-only: never ships in the product image, so the
+    # file-level copyleft has no distribution consequence. Profiles
+    # (dev/ci/thorough) are registered in tests/property/conftest.py.
+    "hypothesis>=6.161",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "unit: pure unit tests, no I/O",
+    "integration: tests that hit downstream services",
+    "provider: tests that hit a real LLM provider (require API key)",
+    "slow: tests that take longer than 5s",
+]
+
+# DE-229 — mutation testing (mutmut 3.x reads this section from pyproject.toml).
+#
+# Scope is a deliberate critical-module allowlist: the routing/policy
+# choke points and the Anonymization Layer — the gateway code whose test
+# suites must catch real defects (PRD §5.8). Rationale and score history:
+# docs/quality/mutation-scores.md.
+#
+# Runs nightly in .github/workflows/mutation.yml (never as a PR gate).
+# Local run after `uv sync --frozen --extra dev --group mutation`: `mutmut run` from gateway/. The test selection below excludes
+# suites that resolve gateway.yaml.example via the repo root (e.g.
+# tests/test_inference_tier_floor.py): mutmut executes tests from its
+# mutants/ sandbox copy, where that repo-root-relative path breaks.
+[tool.mutmut]
+source_paths = ["app"]
+# First wave is keyless/model-free; slow NLP integration remains DE-229 work.
+pytest_add_cli_args = ["-m", "not slow and not provider"]
+only_mutate = [
+    # Tier-Derivation + routing policy enforcement (PRD §3.13 / §4.4).
+    "app/router.py",
+    "app/tier_floor.py",
+    # Routing-log writer — the per-request audit choke point (PRD §1.5.2).
+    "app/routing_log.py",
+    # Anonymization Layer (PRD §4.7), incl. recognizers/.
+    "app/anonymization/*",
+]
+pytest_add_cli_args_test_selection = [
+    "tests/test_tier_floor.py",
+    "tests/test_router.py",
+    "tests/test_route_tool_call.py",
+    "tests/test_routing_log.py",
+    "tests/anonymization",
+]
+
+[tool.mypy]
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[dependency-groups]
+# DE-229: opt-in only; normal dev/runtime installs exclude mutation tooling.
+mutation = ["mutmut==3.8.0"]

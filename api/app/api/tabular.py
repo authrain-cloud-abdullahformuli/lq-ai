@@ -1,0 +1,1437 @@
+"""Tabular / Multi-Document Review endpoints — M3-C2.
+
+Surface (per [PRD §3.14](docs/PRD.md#314-tabular--multi-document-review-m3)):
+
+* ``POST   /api/v1/tabular/preview-cost`` — synchronous cost preview;
+  no execution row is created. The UI calls this before showing the
+  confirmation modal (Decision C-5).
+* ``POST   /api/v1/tabular/execute`` — kick off a tabular execution.
+  Creates a :class:`TabularExecution` row at ``status='pending'``,
+  enqueues the ARQ worker job on the shared playbook queue (per
+  Decision C-3 — same queue as Easy Playbook). Returns 202 + the row.
+* ``GET    /api/v1/tabular/executions`` — list the caller's
+  executions (paginated, recent-first, soft-deleted excluded).
+* ``GET    /api/v1/tabular/executions/{id}`` — full state + grid.
+* ``DELETE /api/v1/tabular/executions/{id}`` — soft delete; sets
+  ``deleted_at``.
+* ``POST   /api/v1/tabular/executions/{id}/cancel`` — set status to
+  ``cancelled``; the worker honours this on the next cell-iteration
+  boundary check.
+
+Authorization
+-------------
+
+Router-level ``Depends(get_active_user)`` gates every endpoint.
+Per-endpoint: rows are scoped to ``user_id == caller.id`` (admins
+see everything). 404 collapses missing + unauthorized (no
+information leakage), matching the M3-A6 Easy Playbook posture.
+
+Column-spec resolution
+----------------------
+
+Either ``skill_name`` OR ``columns`` (ad-hoc spec) is required. A
+``skill_name`` resolves through the D8.1b stack (DE-297): the caller's
+user-scope shadow first, then the newest team-scope shadow, then the
+live :class:`SkillRegistry` built-in. User/team rows carry their column
+spec in ``frontmatter_extra`` (validated at create/PATCH time against
+the same ``LQAIFrontmatter`` schema built-ins parse with); built-ins
+carry it in ``lq_ai.columns``. The resolved column list is snapshotted
+onto the row at request time (Decision C-1 snapshotting posture:
+re-rendering the grid a week later must be honest about what was
+actually run).
+
+Cost-preview shape
+------------------
+
+Per Decision C-5, the preview returns ``cells_count``,
+``estimated_tokens``, ``estimated_cost_usd``, and a
+``per_tier_breakdown`` informational map. The frontend gates the
+big "Run" button behind a confirmation checkbox for previews
+above ``CONFIRMATION_THRESHOLD_USD`` ($1.00 default per the prep
+doc — the threshold is enforced UI-side, not server-side).
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import logging
+import re
+import uuid
+from datetime import UTC, datetime
+from typing import Annotated, Any, Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from pydantic import ValidationError
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.dependencies import ActiveUser
+from app.audit import audit_action
+from app.authz.matters import require_document_matter_access
+from app.clients.gateway import GatewayClient, get_gateway_client
+from app.db.session import get_db
+from app.errors import Forbidden, NotFound
+from app.models.document import Document, DocumentChunk
+from app.models.tabular import TabularBulkOp, TabularCellCitation, TabularExecution
+from app.models.user import User
+from app.models.user_skill import UserSkill
+from app.schemas.tabular import (
+    Citation,
+    ColumnSpec,
+    TabularBulkOpPreviewRequest,
+    TabularBulkOpPreviewResponse,
+    TabularBulkOpRequest,
+    TabularBulkOpResponse,
+    TabularExecutionCreate,
+    TabularExecutionResponse,
+    TabularExecutionSummary,
+    TabularPreviewCostRequest,
+    TabularPreviewCostResponse,
+    TabularResults,
+)
+from app.skills.registry import MutableSkillRegistry
+from app.skills.schema import parse_table_skill_extra
+from app.tabular.bulk_ops import estimate_bulk_op_cost
+from app.tabular.cost import estimate_tabular_execution_cost
+from app.workers.queue import enqueue_tabular_bulk_op_job, enqueue_tabular_execution_job
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["tabular"])
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _registry(request: Request) -> MutableSkillRegistry:
+    """Return the live :class:`MutableSkillRegistry` from app state.
+
+    Mirrors :func:`app.api.skills._registry`. The lifespan handler
+    installs ``app.state.skill_registry``; if the handler is somehow
+    exercised before that, surface a clear error rather than
+    AttributeError.
+    """
+
+    holder: MutableSkillRegistry | None = getattr(request.app.state, "skill_registry", None)
+    if holder is None:
+        from app.errors import InternalError
+
+        raise InternalError(
+            message="Skill registry is not initialised; the API process is "
+            "not yet ready to serve tabular requests.",
+            details={"hint": "lifespan startup did not run"},
+        )
+    return holder
+
+
+def _bake_skill_defaults(
+    columns: list[ColumnSpec],
+    skill_ensemble: bool | None,
+    skill_minimum_tier: int | None,
+) -> list[ColumnSpec]:
+    """Snapshot skill defaults so preview and execution use the same values.
+
+    Columns with no value inherit the skill default. Explicit per-column
+    ensemble and tier overrides remain unchanged.
+    """
+    for col in columns:
+        if col.ensemble_verification is None:
+            col.ensemble_verification = skill_ensemble
+        if col.minimum_inference_tier is None:
+            col.minimum_inference_tier = skill_minimum_tier
+    return columns
+
+
+def _columns_from_user_skill_row(row: UserSkill, *, skill_name: str) -> list[ColumnSpec]:
+    """Resolve a user/team-scope row's ``frontmatter_extra`` to columns.
+
+    DE-297 — the user-skill half of table-mode hydration. Parses the
+    extension keys through the same :class:`LQAIFrontmatter` model the
+    built-in loader uses, so both sources apply identical validation
+    (tier bounds, non-empty name/query). Create/PATCH already reject
+    invalid shapes; the re-parse here guards legacy rows written before
+    that validation landed — those surface as a 400, never a 500.
+    """
+
+    extra = dict(row.frontmatter_extra or {})
+    try:
+        lq = parse_table_skill_extra(extra)
+    except ValidationError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"skill {skill_name!r} has an invalid column spec; re-save it "
+                "from the skill editor before running a tabular review"
+            ),
+        ) from None
+    if lq is None or not lq.columns:
+        raise HTTPException(
+            status_code=400,
+            detail=f"skill {skill_name!r} has no columns (not a table-mode skill)",
+        )
+    resolved = [ColumnSpec.model_validate(col.model_dump()) for col in lq.columns]
+    return _bake_skill_defaults(resolved, lq.ensemble_verification, lq.minimum_inference_tier)
+
+
+async def _resolve_columns(
+    request: Request,
+    db: AsyncSession,
+    *,
+    user: User,
+    skill_name: str | None,
+    ad_hoc: list[ColumnSpec] | None,
+) -> tuple[str | None, list[ColumnSpec]]:
+    """Resolve the request's column spec to (skill_name, columns).
+
+    Either ``skill_name`` OR ``ad_hoc`` must be supplied. When
+    ``skill_name`` is given, resolve it through the D8.1b stack —
+    the caller's user-scope shadow, then the newest accessible
+    team-scope shadow, then the registered built-in (DE-297: user/team
+    rows carry their spec in ``frontmatter_extra``; built-ins in
+    ``lq_ai.columns``) — and snapshot the list. When ``ad_hoc`` is
+    given, use it directly. Both-or-neither is a 400.
+
+    Returns the resolved skill_name (None for ad-hoc) + a non-empty
+    list of :class:`ColumnSpec`. Raises HTTPException(400) on
+    validation errors and HTTPException(404) on unknown skill /
+    skill-without-columns.
+    """
+
+    if skill_name and ad_hoc:
+        raise HTTPException(
+            status_code=400,
+            detail="provide either skill_name or columns, not both",
+        )
+    if not skill_name and not ad_hoc:
+        raise HTTPException(
+            status_code=400,
+            detail="provide either skill_name or columns",
+        )
+
+    if skill_name:
+        # Local import (matches app/api/internal.py) — the shadow
+        # loaders + resolution order live in skills.py; importing here
+        # keeps the tabular → skills edge one-way and explicit.
+        from app.api.skills import _load_team_shadow, _load_user_shadow
+
+        shadow = await _load_user_shadow(db, user_id=user.id, slug=skill_name)
+        if shadow is None:
+            shadow = await _load_team_shadow(db, user_id=user.id, slug=skill_name)
+        if shadow is not None:
+            return skill_name, _columns_from_user_skill_row(shadow, skill_name=skill_name)
+
+        record = _registry(request).current().get(skill_name)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"skill {skill_name!r} not found")
+        skill_columns = record.frontmatter.lq_ai.columns
+        if record.frontmatter.lq_ai.output_format != "table" or not skill_columns:
+            raise HTTPException(
+                status_code=400,
+                detail=f"skill {skill_name!r} has no columns (not a table-mode skill)",
+            )
+        # Re-validate through the wire-side ColumnSpec so any
+        # skill-side fields the wire schema doesn't honor are
+        # stripped consistently.
+        resolved = [ColumnSpec.model_validate(col.model_dump()) for col in skill_columns]
+        return skill_name, _bake_skill_defaults(
+            resolved,
+            record.frontmatter.lq_ai.ensemble_verification,
+            record.frontmatter.lq_ai.minimum_inference_tier,
+        )
+
+    # ad_hoc branch — the request-validation min_length=1 on columns
+    # in TabularExecutionCreate already covers the empty case.
+    assert ad_hoc is not None  # for the type checker
+    return None, ad_hoc
+
+
+async def _load_caller_owned_documents(
+    db: AsyncSession,
+    *,
+    document_ids: list[uuid.UUID],
+    user: ActiveUser,
+) -> list[Document]:
+    """Load documents the caller has access to via the file ownership chain.
+
+    Mirrors the M3-A6 Easy Playbook helper. The visibility rule:
+    each :class:`Document` has a parent :class:`File` whose
+    ``owner_id`` must match the caller (admins see all) AND which
+    has not been soft-deleted. Missing / cross-owner / soft-deleted
+    documents collapse into "not found" at the caller — running
+    tabular extraction over documents the user no longer "has"
+    would surprise on the audit trail.
+    """
+
+    from app.models.file import File as FileModel
+
+    stmt = (
+        select(Document)
+        .where(Document.id.in_(document_ids))
+        .join(FileModel, Document.file_id == FileModel.id)
+        .where(FileModel.deleted_at.is_(None))
+    )
+    if not user.is_admin:
+        stmt = stmt.where(FileModel.owner_id == user.id)
+    rows = (await db.execute(stmt)).scalars().all()
+    await require_document_matter_access(db, document_ids, user, need="write")
+    return list(rows)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/tabular/preview-cost",
+    response_model=TabularPreviewCostResponse,
+    summary="Preview the cost of a proposed tabular execution.",
+)
+async def preview_tabular_cost(
+    body: TabularPreviewCostRequest,
+    request: Request,
+    user: ActiveUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    gateway: Annotated[GatewayClient, Depends(get_gateway_client)],
+) -> TabularPreviewCostResponse:
+    """Synchronous cost preview — no execution row is created.
+
+    The UI calls this before showing the confirmation modal so the
+    operator sees the cell-count + estimated cost + per-tier
+    breakdown (Decision C-5). The estimator's rolling average
+    (M2-E2 pattern) caches per ~5 minutes in-process; rapid re-previews
+    during column-spec editing don't thrash the DB.
+
+    Ensemble columns preview higher (Donna #6): the estimator adds one
+    ensemble-pass cost (N judge calls) per ensemble cell. We fetch the
+    gateway's resolved ensemble config so the premium reflects the
+    deployment's actual judge models + default; the config is
+    process-cached and ``get_citation_engine_ensemble_config`` already
+    returns ``None`` on any gateway error / unreachable, so an
+    unconfigured or down gateway simply yields no premium (graceful
+    degrade — the preview stays a non-fatal pre-flight).
+
+    Authorization is the router-level ``get_active_user`` gate — any
+    authenticated caller may preview costs against their own document
+    selection. The document-ownership check is enforced at execute
+    time; preview doesn't load the documents. ``user`` also drives the
+    DE-297 skill-name resolution (the caller's user/team shadows take
+    precedence over a built-in at the same slug).
+    """
+
+    await require_document_matter_access(db, body.document_ids, user)
+
+    _, columns = await _resolve_columns(
+        request,
+        db,
+        user=user,
+        skill_name=body.skill_name,
+        ad_hoc=body.columns,
+    )
+
+    # ``columns`` is the RESOLVED spec (skill-level ensemble fallback
+    # already baked in by ``_resolve_columns``); the estimator only needs
+    # to apply the column-value-or-deployment-default resolution on top.
+    ensemble_config = await gateway.get_citation_engine_ensemble_config()
+
+    return await estimate_tabular_execution_cost(
+        db,
+        document_ids=list(body.document_ids),
+        columns=columns,
+        ensemble_config=ensemble_config,
+    )
+
+
+@router.post(
+    "/tabular/execute",
+    response_model=TabularExecutionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Start a tabular execution.",
+)
+async def create_tabular_execution(
+    body: TabularExecutionCreate,
+    request: Request,
+    user: ActiveUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> TabularExecutionResponse:
+    """Kick off a tabular execution against the supplied document corpus.
+
+    Authorization: the caller must own every document in
+    ``document_ids``. Cross-user or non-existent ids collapse into a
+    single 404 (no information leakage), matching the M3-A6 Easy
+    Playbook posture.
+
+    Creates a :class:`TabularExecution` row at ``status='pending'``
+    and enqueues the ARQ worker job on the shared playbook queue
+    (per Decision C-3). Returns 202 immediately with the row; the
+    result-view polls
+    ``GET /api/v1/tabular/executions/{id}`` until status reaches
+    a terminal state.
+
+    Per the M3-C2 quality bar, "execution completed" does NOT mean
+    every cell is correct — the result-view's per-cell citation
+    drawer is where the user-attorney validates extractions before
+    relying on them.
+    """
+
+    documents = await _load_caller_owned_documents(
+        db,
+        document_ids=list(body.document_ids),
+        user=user,
+    )
+    if len(documents) != len(body.document_ids):
+        raise HTTPException(status_code=404, detail="one or more documents not found")
+
+    resolved_skill_name, columns = await _resolve_columns(
+        request,
+        db,
+        user=user,
+        skill_name=body.skill_name,
+        ad_hoc=body.columns,
+    )
+
+    # Snapshot the column spec to the row's JSONB so re-rendering a
+    # week later honours Decision C-1's snapshotting invariant.
+    columns_json = [col.model_dump(mode="json") for col in columns]
+
+    execution = TabularExecution(
+        user_id=user.id,
+        skill_name=resolved_skill_name,
+        status="pending",
+        document_ids=list(body.document_ids),
+        columns=columns_json,
+        cost_estimate_usd=body.confirmed_cost_usd,
+    )
+    db.add(execution)
+    await db.flush()
+
+    await audit_action(
+        db,
+        user_id=user.id,
+        action="tabular.execution_started",
+        resource_type="tabular_execution",
+        resource_id=str(execution.id),
+        request=request,
+        details={
+            "document_count": len(body.document_ids),
+            "column_count": len(columns),
+            "skill_name": resolved_skill_name,
+            "confirmed_cost_usd": (
+                str(body.confirmed_cost_usd) if body.confirmed_cost_usd is not None else None
+            ),
+        },
+    )
+    await db.commit()
+    await db.refresh(execution)
+
+    enqueued = await enqueue_tabular_execution_job(execution.id)
+    logger.info(
+        "tabular_execution_started",
+        extra={
+            "event": "tabular_execution_started",
+            "user_id": str(user.id),
+            "execution_id": str(execution.id),
+            "enqueued": enqueued,
+            "document_count": len(body.document_ids),
+            "column_count": len(columns),
+        },
+    )
+
+    return await _to_response(db, execution)
+
+
+@router.get(
+    "/tabular/executions",
+    response_model=list[TabularExecutionSummary],
+    summary="List the caller's tabular executions.",
+)
+async def list_tabular_executions(
+    user: ActiveUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: int = 50,
+) -> list[TabularExecutionSummary]:
+    """Return the caller's tabular executions, recent-first, soft-deleted excluded.
+
+    Admins see all executions; non-admins see only their own
+    (matches the Easy Playbook list posture).
+    """
+
+    stmt = select(TabularExecution).where(TabularExecution.deleted_at.is_(None))
+    if not user.is_admin:
+        stmt = stmt.where(
+            or_(TabularExecution.user_id == user.id, TabularExecution.user_id.is_(None))
+        )
+    stmt = stmt.order_by(TabularExecution.created_at.desc()).limit(limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    visible = []
+    for row in rows:
+        try:
+            await require_document_matter_access(db, row.document_ids, user)
+        except (NotFound, Forbidden):
+            continue
+        visible.append(_to_summary(row))
+    return visible
+
+
+@router.get(
+    "/tabular/executions/{execution_id}",
+    response_model=TabularExecutionResponse,
+    summary="Get a tabular execution by id.",
+)
+async def get_tabular_execution(
+    execution_id: uuid.UUID,
+    user: ActiveUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> TabularExecutionResponse:
+    """Return one tabular execution — full state + grid results.
+
+    Authorization: caller must be the row's ``user_id`` OR an admin.
+    Cross-user / missing / soft-deleted rows collapse into 404.
+
+    Citations (DE-309): when the execution was produced by the minting
+    aggregate node (``results.schema_version`` is a minting vintage,
+    currently ``m3-c2-v2``), every cell's ``citations`` list is rebuilt
+    from the execution's minted ``tabular_cell_citations`` rows — real
+    ``citation_id``s plus chunk-local char offsets; cells the locator
+    could not ground get an EMPTY list (fail-closed: they render
+    unverified), including the case where the execution minted zero
+    rows in total. Executions predating migration 0079 (``m3-c2-v1``)
+    keep the legacy uuid5-bridge citations synthesized by the schema
+    validator. The discriminator is the persisted schema-version stamp,
+    not minted-row presence — row count cannot distinguish a legacy-v1
+    execution from a minting-vintage one where nothing located.
+    """
+
+    row = await _load_caller_execution(db, execution_id=execution_id, user=user)
+    response = await _to_response(db, row)
+    await _resolve_cell_citations(db, row, response.results)
+    await _enrich_cell_citations(db, response)
+    return response
+
+
+@router.delete(
+    "/tabular/executions/{execution_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Soft-delete a tabular execution.",
+    response_class=Response,
+)
+async def delete_tabular_execution(
+    execution_id: uuid.UUID,
+    user: ActiveUser,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Response:
+    """Soft-delete (sets ``deleted_at``). Already-deleted rows return 404."""
+
+    row = await _load_caller_execution(db, execution_id=execution_id, user=user)
+    row.deleted_at = datetime.now(UTC)
+    await audit_action(
+        db,
+        user_id=user.id,
+        action="tabular.execution_deleted",
+        resource_type="tabular_execution",
+        resource_id=str(execution_id),
+        request=request,
+    )
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/tabular/executions/{execution_id}/cancel",
+    response_model=TabularExecutionResponse,
+    summary="Cancel a pending or running tabular execution.",
+)
+async def cancel_tabular_execution(
+    execution_id: uuid.UUID,
+    user: ActiveUser,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> TabularExecutionResponse:
+    """Set status to ``cancelled``.
+
+    The worker's per-cell loop checks the row status at each cell
+    boundary; on cancellation it stops accepting new cells and the
+    aggregate node writes whatever partial results landed. Already-
+    terminal rows (``completed`` / ``failed`` / ``cancelled``) are
+    a 409 — operators wanting a clean re-run start a new execution
+    via ``POST /tabular/execute``.
+    """
+
+    row = await _load_caller_execution(db, execution_id=execution_id, user=user)
+    if row.status in {"completed", "failed", "cancelled"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"execution already in terminal status {row.status!r}",
+        )
+    row.status = "cancelled"
+    row.completed_at = datetime.now(UTC)
+    await audit_action(
+        db,
+        user_id=user.id,
+        action="tabular.execution_cancelled",
+        resource_type="tabular_execution",
+        resource_id=str(execution_id),
+        request=request,
+    )
+    await db.commit()
+    await db.refresh(row)
+    # Same DE-309 citation treatment as the GET handler: a cancelled
+    # minting-vintage execution's partial grid must not serve
+    # uuid5-bridge citations for cells the locator never grounded.
+    response = await _to_response(db, row)
+    await _resolve_cell_citations(db, row, response.results)
+    await _enrich_cell_citations(db, response)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Bulk operations (DE-304 / ADR 0040)
+# ---------------------------------------------------------------------------
+
+
+def _bulk_op_grid_row_count(row: TabularExecution) -> int:
+    """Number of grid rows in the execution's persisted results."""
+
+    rows = (row.results or {}).get("rows")
+    return len(rows) if isinstance(rows, list) else 0
+
+
+async def _load_bulk_op_target(
+    db: AsyncSession,
+    *,
+    execution_id: uuid.UUID,
+    user: ActiveUser,
+) -> TabularExecution:
+    """Load + validate the parent execution for a bulk op.
+
+    Ownership follows :func:`_load_caller_execution` (missing /
+    cross-user / soft-deleted collapse into 404). The execution must be
+    ``status='completed'`` — bulk-operating a partial grid would
+    mislead (same 409 posture as export; ADR 0040 D2).
+    """
+
+    row = await _load_caller_execution(db, execution_id=execution_id, user=user)
+    await require_document_matter_access(db, row.document_ids, user, need="write")
+    if row.status != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"execution must be in status='completed' for bulk operations "
+                f"(current status: {row.status!r})"
+            ),
+        )
+    return row
+
+
+def _validate_bulk_op_params(
+    row: TabularExecution,
+    *,
+    kind: str,
+    column_name: str | None,
+) -> dict[str, str | None]:
+    """Validate op parameters against the execution's snapshotted spec.
+
+    ``summarize_column`` requires ``column_name`` to name a column of
+    the *snapshotted* spec (Decision C-1: the op targets what was
+    actually run, not what the skill currently says). Returns the
+    ``params`` payload to snapshot onto the bulk-op row.
+    """
+
+    known = {str(col.get("name")) for col in row.columns}
+    if not column_name or column_name not in known:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{kind} requires column_name to be one of the "
+                f"execution's columns (got {column_name!r})"
+            ),
+        )
+    return {"column_name": column_name}
+
+
+async def _bulk_op_skill_snapshot(
+    request: Request,
+    db: AsyncSession,
+    user: ActiveUser,
+    body: TabularBulkOpPreviewRequest | TabularBulkOpRequest,
+) -> dict[str, Any]:
+    """Resolve caller-visible skills through the existing user/team/built-in path.
+
+    Freeze instructions and references before enqueueing. The worker sends this
+    immutable body through the gateway's existing inline-skill assembler.
+    """
+    import hashlib
+    import json
+
+    from app.api.skills import _resolve_full_skill_payload, get_skill_inputs
+
+    payload = await _resolve_full_skill_payload(
+        request, db=db, user_id=user.id, skill_name=body.skill_name
+    )
+    output_format = payload.get("output_format")
+    allowed = {"report"} if body.kind == "redline_rows" else {"report", "markdown", "summary"}
+    if output_format not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose a report skill for redlining or a report/markdown summary skill for summarization",
+        )
+    definitions = await get_skill_inputs(request, body.skill_name, user, db)
+    bindings = dict(body.skill_inputs)
+    for definition in definitions.required + definitions.optional:
+        if definition.name not in bindings and definition.default is not None:
+            bindings[definition.name] = definition.default
+        if definition.required and definition.type in {"document", "file"}:
+            # Source text stays in the user context; do not copy it into skill instructions.
+            bindings.setdefault(
+                definition.name,
+                "Use the selected-column source context provided in the user message.",
+            )
+    missing = [
+        definition.name
+        for definition in definitions.required
+        if bindings.get(definition.name) is None
+        or (
+            isinstance(bindings.get(definition.name), str) and not bindings[definition.name].strip()
+        )
+    ]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing skill inputs: {', '.join(missing)}")
+    if not str(payload["content_md"]).strip():
+        raise HTTPException(status_code=400, detail="Skill instructions are empty")
+    snapshot = {
+        "name": body.skill_name,
+        "version": payload.get("version", "unversioned"),
+        "scope": payload.get("scope"),
+        "content_md": payload["content_md"],
+        "content_yaml": payload["content_yaml"],
+        "reference_files": payload.get("reference_files", []),
+        "minimum_inference_tier": payload.get("minimum_inference_tier"),
+        "inputs": bindings,
+    }
+    digest = hashlib.sha256(
+        json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+    snapshot["content_hash"] = digest
+    if isinstance(body, TabularBulkOpRequest) and body.skill_content_hash != digest:
+        raise HTTPException(
+            status_code=409, detail="Skill changed since preview; preview again before starting"
+        )
+    return snapshot
+
+
+@router.get(
+    "/tabular/bulk-ops",
+    response_model=list[TabularBulkOpResponse],
+    summary="List the caller's retained bulk-operation outputs.",
+)
+async def list_tabular_bulk_ops(
+    user: ActiveUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[TabularBulkOpResponse]:
+    rows = await db.scalars(
+        select(TabularBulkOp)
+        .where(TabularBulkOp.user_id == user.id)
+        .order_by(TabularBulkOp.created_at.desc(), TabularBulkOp.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    visible = []
+    for row in rows:
+        try:
+            await _authorize_bulk_sources(db, row, user)
+        except (NotFound, Forbidden):
+            continue
+        visible.append(TabularBulkOpResponse.model_validate(row))
+    return visible
+
+
+@router.get(
+    "/tabular/bulk-ops/{bulk_op_id}",
+    response_model=TabularBulkOpResponse,
+    summary="Read an owned report or memo independently of its source execution.",
+)
+async def get_tabular_bulk_op(
+    bulk_op_id: uuid.UUID,
+    user: ActiveUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> TabularBulkOpResponse:
+    row = await db.scalar(
+        select(TabularBulkOp).where(
+            TabularBulkOp.id == bulk_op_id, TabularBulkOp.user_id == user.id
+        )
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Bulk operation not found")
+    await _authorize_bulk_sources(db, row, user)
+    return TabularBulkOpResponse.model_validate(row)
+
+
+@router.post(
+    "/tabular/executions/{execution_id}/bulk-ops/preview-cost",
+    response_model=TabularBulkOpPreviewResponse,
+    summary="Preview the cost of a proposed bulk operation.",
+)
+async def preview_tabular_bulk_op_cost(
+    execution_id: uuid.UUID,
+    body: TabularBulkOpPreviewRequest,
+    user: ActiveUser,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> TabularBulkOpPreviewResponse:
+    """Synchronous cost preview — no bulk-op row is created.
+
+    Mirrors ``POST /tabular/preview-cost`` (Decision C-5): the UI calls
+    this before arming the confirmation gate. Calls count is one per
+    grid row for ``redline_rows``, one total for ``summarize_column``;
+    per-call cost is the rolling average over recent
+    ``purpose='tabular_bulk_op'`` routing-log rows (conservative
+    cold-start default before calibration; ADR 0040 D3).
+    """
+
+    row = await _load_bulk_op_target(db, execution_id=execution_id, user=user)
+    _validate_bulk_op_params(row, kind=body.kind, column_name=body.column_name)
+    snapshot = await _bulk_op_skill_snapshot(request, db, user, body)
+    preview = await estimate_bulk_op_cost(db, kind=body.kind, n_rows=_bulk_op_grid_row_count(row))
+    preview.skill_name = snapshot["name"]
+    preview.skill_version = snapshot["version"]
+    preview.skill_content_hash = snapshot["content_hash"]
+    return preview
+
+
+@router.post(
+    "/tabular/executions/{execution_id}/bulk-ops",
+    response_model=TabularBulkOpResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Start a bulk operation over a completed tabular execution.",
+)
+async def create_tabular_bulk_op(
+    execution_id: uuid.UUID,
+    body: TabularBulkOpRequest,
+    user: ActiveUser,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> TabularBulkOpResponse:
+    """Create a ``tabular_bulk_ops`` row at ``pending`` and enqueue the
+    ARQ job on the shared playbook queue (Decision C-3). Returns 202;
+    the detail view polls ``GET /tabular/executions/{id}`` — the
+    ``bulk_ops`` array embedded there is the read-side (ADR 0040 D2).
+
+    ``confirmed_cost_usd`` is the echo of the preview response —
+    persisted for audit; the $1.00 confirmation gate stays UI-side,
+    exactly like ``POST /tabular/execute`` (Decision C-5).
+
+    Per ADR 0040 D4, batch "completed" does NOT mean every item
+    succeeded — failed items are persisted per-row and rendered as
+    failures in the report.
+    """
+
+    row = await _load_bulk_op_target(db, execution_id=execution_id, user=user)
+    params = _validate_bulk_op_params(row, kind=body.kind, column_name=body.column_name)
+    if _bulk_op_grid_row_count(row) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="execution has no results grid rows to bulk-operate on",
+        )
+
+    snapshot = await _bulk_op_skill_snapshot(request, db, user, body)
+    params["skill_name"] = body.skill_name
+    bulk_op = TabularBulkOp(
+        execution_id=row.id,
+        source_execution_id=row.id,
+        provenance={
+            "skill_snapshot": snapshot,
+            "source_execution_id": str(row.id),
+            "created_at": row.created_at.isoformat(),
+            "columns": list(row.columns),
+            "documents": [
+                {"document_id": item.get("document_id"), "document_name": item.get("document_name")}
+                for item in (row.results or {}).get("rows", [])
+            ],
+        },
+        user_id=user.id,
+        kind=body.kind,
+        status="pending",
+        params=params,
+        confirmed_cost_usd=body.confirmed_cost_usd,
+    )
+    db.add(bulk_op)
+    await db.flush()
+
+    await audit_action(
+        db,
+        user_id=user.id,
+        action="tabular.bulk_op_started",
+        resource_type="tabular_bulk_op",
+        resource_id=str(bulk_op.id),
+        request=request,
+        details={
+            "execution_id": str(row.id),
+            "kind": body.kind,
+            "column_name": body.column_name,
+            "confirmed_cost_usd": (
+                str(body.confirmed_cost_usd) if body.confirmed_cost_usd is not None else None
+            ),
+        },
+    )
+    await db.commit()
+    await db.refresh(bulk_op)
+
+    enqueued = await enqueue_tabular_bulk_op_job(bulk_op.id)
+    if not enqueued:
+        bulk_op.status = "failed"
+        bulk_op.error_text = (
+            "Could not queue this operation; retry when the worker queue is available"
+        )
+        bulk_op.completed_at = datetime.now(UTC)
+        await audit_action(
+            db,
+            user_id=user.id,
+            action="tabular.bulk_op_enqueue_failed",
+            resource_type="tabular_bulk_op",
+            resource_id=str(bulk_op.id),
+            request=request,
+        )
+        await db.commit()
+    logger.info(
+        "tabular_bulk_op_started",
+        extra={
+            "event": "tabular_bulk_op_started",
+            "user_id": str(user.id),
+            "execution_id": str(row.id),
+            "bulk_op_id": str(bulk_op.id),
+            "kind": body.kind,
+            "enqueued": enqueued,
+        },
+    )
+
+    return TabularBulkOpResponse.model_validate(bulk_op)
+
+
+# ---------------------------------------------------------------------------
+# Export (M3-C4a — XLSX + CSV)
+# ---------------------------------------------------------------------------
+
+
+_XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_CSV_MEDIA_TYPE = "text/csv"
+
+
+@router.get(
+    "/tabular/executions/{execution_id}/export",
+    summary="Export a completed tabular execution as XLSX or CSV.",
+    responses={
+        200: {
+            "description": "Streaming export — Content-Type matches format.",
+            "content": {
+                _XLSX_MEDIA_TYPE: {},
+                _CSV_MEDIA_TYPE: {},
+            },
+        },
+        409: {"description": "Execution not in terminal status — cannot export."},
+    },
+)
+async def export_tabular_execution(
+    execution_id: uuid.UUID,
+    user: ActiveUser,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    format: Annotated[
+        Literal["xlsx", "csv"],
+        Query(
+            description="Export format. `xlsx` carries citations as cell comments; `csv` flattens citations into a `citation_links` column."
+        ),
+    ] = "xlsx",
+) -> Response:
+    """Stream the tabular grid in XLSX or CSV.
+
+    Both formats include the document column (leftmost) plus one column
+    per declared column spec, in spec order. Cells with
+    ``confidence='failed'`` render as ``"(failed)"`` rather than an
+    empty string so operators can spot the gap without cross-referencing
+    the source execution.
+
+    Citation surfacing differs by format:
+
+    * **XLSX** — each grid cell with at least one citation carries an
+      openpyxl ``Comment`` listing the citation IDs and confidences.
+      Operators can hover any cell in Excel / Numbers / Google Sheets
+      to see the source. (Up to 5 citations per comment; the cell
+      retains the full count.)
+    * **CSV** — a trailing ``citation_links`` column per row carries a
+      semicolon-separated list of ``"<column_name>:<citation_id>"``
+      pairs across every cell in the row. Empty when no cell in the
+      row had citations.
+
+    The execution must be in ``status='completed'``. Pending / running
+    / cancelled / failed rows return 409 — partial grids would mislead
+    downstream consumers. (DE-XXX candidate: a separate
+    ``allow_partial=true`` query param to export partial grids with a
+    visible watermark; deferred until an operator surfaces the need.)
+    """
+
+    row = await _load_caller_execution(db, execution_id=execution_id, user=user)
+    if row.status != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"execution must be in status='completed' to export "
+                f"(current status: {row.status!r})"
+            ),
+        )
+
+    columns = [ColumnSpec.model_validate(c) for c in (row.columns or [])]
+    results = TabularResults.model_validate(row.results) if row.results else TabularResults(rows=[])
+    await _resolve_cell_citations(db, row, results)
+
+    await audit_action(
+        db,
+        user_id=user.id,
+        action="tabular.execution_exported",
+        resource_type="tabular_execution",
+        resource_id=str(execution_id),
+        request=request,
+        details={"format": format, "row_count": len(results.rows)},
+    )
+    await db.commit()
+
+    if format == "xlsx":
+        content = _build_xlsx(columns=columns, results=results)
+        media_type = _XLSX_MEDIA_TYPE
+        filename = f"tabular-{execution_id}.xlsx"
+    else:
+        content = _build_csv(columns=columns, results=results).encode("utf-8")
+        media_type = _CSV_MEDIA_TYPE
+        filename = f"tabular-{execution_id}.csv"
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _build_xlsx(*, columns: list[ColumnSpec], results: TabularResults) -> bytes:
+    """Render the grid as an XLSX workbook (openpyxl).
+
+    Cell comments carry citation metadata so an operator can pivot
+    from the spreadsheet back to the deployment. The comment text is
+    deliberately compact (citation IDs + confidence) — operators
+    needing the full source text click through to the deployment URL
+    (a deferred enhancement covers stamping a deployment URL on each
+    comment, DE-XXX).
+    """
+
+    # Lazy import keeps the openpyxl dependency from being imported on
+    # the FastAPI app's hot path (export is the only consumer).
+    from openpyxl import Workbook  # type: ignore[import-untyped]
+
+    wb = Workbook()
+    ws = wb.active
+    if ws is None:
+        # openpyxl always creates an active sheet on Workbook(); the
+        # branch exists for the type checker.
+        ws = wb.create_sheet()
+    ws.title = "Tabular Review"
+
+    column_names = [c.name for c in columns]
+
+    # Header row.
+    ws.cell(row=1, column=1, value="Document")
+    for ci, name in enumerate(column_names, start=2):
+        # Store user-controlled values as text, including names starting with '='.
+        ws.cell(row=1, column=ci, value=name).data_type = "s"
+
+    # Data rows.
+    for ri, grid_row in enumerate(results.rows, start=2):
+        ws.cell(row=ri, column=1, value=grid_row.document_name).data_type = "s"
+        for ci, name in enumerate(column_names, start=2):
+            cell_data = grid_row.cells.get(name)
+            value = _cell_display_value(cell_data)
+            xlsx_cell = ws.cell(row=ri, column=ci, value=value)
+            xlsx_cell.data_type = "s"
+            if cell_data and cell_data.citations:
+                xlsx_cell.comment = _build_xlsx_comment(cell_data.citations)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _build_csv(*, columns: list[ColumnSpec], results: TabularResults) -> str:
+    """Render the grid as RFC 4180 CSV (stdlib `csv`).
+
+    The trailing ``citation_links`` column flattens every cell's
+    citations in the row into a single semicolon-separated string of
+    ``<column_name>:<citation_id>`` pairs. Empty when no cell had
+    citations.
+    """
+
+    out = io.StringIO()
+    writer = csv.writer(out, quoting=csv.QUOTE_ALL)
+    column_names = [c.name for c in columns]
+    writer.writerow(["Document", *(_csv_literal(name) for name in column_names), "citation_links"])
+
+    for grid_row in results.rows:
+        row_values: list[str] = [grid_row.document_name]
+        row_citations: list[str] = []
+        for name in column_names:
+            cell_data = grid_row.cells.get(name)
+            row_values.append(_cell_display_value(cell_data))
+            if cell_data and cell_data.citations:
+                row_citations.extend(f"{name}:{c.citation_id}" for c in cell_data.citations)
+        row_values.append(";".join(row_citations))
+        writer.writerow(_csv_literal(value) for value in row_values)
+
+    return out.getvalue()
+
+
+# Match formula prefixes, including full-width variants, after characters a
+# spreadsheet may skip or interpret as text markers.
+_CSV_FORMULA_PREFIX = re.compile(r"^[\s\x00-\x1f\ufeff']*[=+\-@\t\r\n\uff1d\uff0b\uff0d\uff20]")
+
+
+def _csv_literal(value: str) -> str:
+    """Give formula-like CSV fields a visible text prefix."""
+    # A literal backtick survives as part of the imported cell value.
+    if _CSV_FORMULA_PREFIX.match(value):
+        return f"`{value}"
+    return value
+
+
+def _cell_display_value(cell_data: object) -> str:
+    """Project a CellResult into a single string for export rendering.
+
+    Failed cells render as ``"(failed)"`` so the gap is visible in the
+    spreadsheet without consulting the source execution. None / missing
+    cells render as the empty string.
+    """
+
+    if cell_data is None:
+        return ""
+    confidence = getattr(cell_data, "confidence", None)
+    if confidence == "failed":
+        return "(failed)"
+    value = getattr(cell_data, "value", None)
+    return value if value is not None else ""
+
+
+def _build_xlsx_comment(citations: list[Citation]) -> object:
+    """Build an openpyxl Comment summarising the cell's citations.
+
+    Caps at 5 citations to keep the comment readable; the full count
+    is preserved in the lead line so operators know whether the
+    summary is complete.
+    """
+
+    from openpyxl.comments import Comment  # type: ignore[import-untyped]
+
+    total = len(citations)
+    shown = citations[:5]
+    lines = [f"{total} citation(s):"]
+    for c in shown:
+        cid = c.citation_id
+        conf = c.confidence
+        lines.append(f"- {cid} ({conf})")
+    if total > len(shown):
+        lines.append(f"- ... and {total - len(shown)} more")
+    return Comment("\n".join(lines), "LQ.AI")
+
+
+# ---------------------------------------------------------------------------
+# Response shaping
+# ---------------------------------------------------------------------------
+
+
+async def _load_caller_execution(
+    db: AsyncSession,
+    *,
+    execution_id: uuid.UUID,
+    user: ActiveUser,
+) -> TabularExecution:
+    """Load one execution + apply the caller-scope visibility rule.
+
+    404 on missing / unauthorized / soft-deleted (single error
+    surface; no information leakage).
+    """
+
+    row = await db.get(TabularExecution, execution_id)
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="execution not found")
+    if not user.is_admin and row.user_id != user.id:
+        raise HTTPException(status_code=404, detail="execution not found")
+    await require_document_matter_access(db, row.document_ids, user)
+    return row
+
+
+async def _load_document_names(
+    db: AsyncSession, document_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, str]:
+    """Return a ``{document_id: filename}`` map for the given ids.
+
+    Joins ``documents → files.filename``. Soft-deleted files are
+    excluded — the caller treats a missing id as a deleted document
+    (renders as the empty string in the response, which the UI flags
+    as "deleted document")."""
+
+    from app.models.file import File as FileModel
+
+    if not document_ids:
+        return {}
+    stmt = (
+        select(Document.id, FileModel.filename)
+        .join(FileModel, Document.file_id == FileModel.id)
+        .where(Document.id.in_(document_ids), FileModel.deleted_at.is_(None))
+    )
+    rows = (await db.execute(stmt)).all()
+    return {row.id: row.filename for row in rows}
+
+
+async def _load_bulk_ops(db: AsyncSession, execution_id: uuid.UUID) -> list[TabularBulkOpResponse]:
+    """Load an execution's bulk ops, recent-first (DE-304 / ADR 0040 D2)."""
+
+    stmt = (
+        select(TabularBulkOp)
+        .where(TabularBulkOp.execution_id == execution_id)
+        .order_by(TabularBulkOp.created_at.desc())
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return [TabularBulkOpResponse.model_validate(op) for op in rows]
+
+
+async def _to_response(db: AsyncSession, row: TabularExecution) -> TabularExecutionResponse:
+    """Convert the ORM row to the response wire shape.
+
+    Async because the response includes a ``document_names`` field
+    that requires a join on ``files`` — keeping the join inside the
+    response builder means every endpoint that returns a single
+    execution gets the names without duplicating the query. The
+    ``bulk_ops`` array (DE-304) is loaded here for the same reason —
+    the detail endpoint the UI polls is the bulk-op read-side."""
+
+    document_ids = list(row.document_ids)
+    name_by_id = await _load_document_names(db, document_ids)
+    document_names = [name_by_id.get(did, "") for did in document_ids]
+    bulk_ops = await _load_bulk_ops(db, row.id)
+    return TabularExecutionResponse.model_validate(
+        {
+            "id": row.id,
+            "user_id": row.user_id,
+            "parent_execution_id": row.parent_execution_id,
+            "skill_name": row.skill_name,
+            "status": row.status,
+            "document_ids": document_ids,
+            "document_names": document_names,
+            "columns": list(row.columns),
+            "results": row.results,
+            "cost_estimate_usd": row.cost_estimate_usd,
+            "cost_actual_usd": row.cost_actual_usd,
+            "error_text": row.error_text,
+            "created_at": row.created_at,
+            "started_at": row.started_at,
+            "completed_at": row.completed_at,
+            "bulk_ops": bulk_ops,
+        }
+    )
+
+
+# ``results.schema_version`` stamps that mark an execution as produced
+# by the DE-309-aware aggregate node — one that mints
+# ``tabular_cell_citations`` rows (possibly zero of them). Extend this
+# set when RESULTS_SCHEMA_VERSION bumps again; anything not listed is
+# treated as legacy-v1 and keeps the uuid5-bridge citations.
+_MINTING_SCHEMA_VERSIONS: frozenset[str] = frozenset({"m3-c2-v2"})
+
+
+def _mints_cell_citations(row: TabularExecution) -> bool:
+    """True when the execution's vintage mints cell citations (DE-309).
+
+    Reads the raw ``results`` JSONB's ``schema_version`` stamp. This —
+    not minted-row presence — is the discriminator for the fail-closed
+    citation rewrite: an execution that minted ZERO rows (nothing
+    located anywhere) is indistinguishable from a legacy-v1
+    execution by row count alone, and must still fail closed.
+    """
+
+    results = row.results
+    if not isinstance(results, dict):
+        return False
+    return results.get("schema_version") in _MINTING_SCHEMA_VERSIONS
+
+
+async def _load_minted_citations(
+    db: AsyncSession,
+    *,
+    execution_id: uuid.UUID,
+) -> list[TabularCellCitation]:
+    """Load the execution's minted provenance rows (DE-309) — one query.
+
+    An empty list means either a legacy-v1 execution or a
+    minting-vintage execution where nothing located;
+    :func:`_mints_cell_citations` (the ``schema_version`` stamp), not
+    row presence, decides whether the rewrite applies.
+    """
+
+    stmt = (
+        select(TabularCellCitation)
+        .where(TabularCellCitation.execution_id == execution_id)
+        .order_by(TabularCellCitation.created_at, TabularCellCitation.id)
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+async def _resolve_cell_citations(
+    db: AsyncSession, row: TabularExecution, results: TabularResults | None
+) -> None:
+    """Project provenance consistently for GET, cancellation and both export formats.
+
+    Only genuine legacy executions keep bridge ids. A minting-vintage
+    execution with zero located rows must clear every bridge citation.
+    """
+    if _mints_cell_citations(row):
+        minted = await _load_minted_citations(db, execution_id=row.id)
+        _apply_minted_citations(results, minted)
+
+
+def _apply_minted_citations(
+    results: TabularResults | None,
+    minted: list[TabularCellCitation],
+) -> None:
+    """Replace bridge citations with the execution's minted rows (DE-309).
+
+    Rows key to a cell by ``(document_id, column_name)`` — the same
+    keying as the results payload (rows by document, cells by column
+    name). Every cell in the grid is rewritten: cells with minted rows
+    get real ``citation_id``s + chunk-local offsets + the locating
+    method/confidence; cells without any get an empty list (fail-closed
+    — an unlocatable value renders unverified, never a synthetic
+    citation). The subsequent :func:`_enrich_cell_citations` pass fills
+    the navigation fields from ``chunk_id`` exactly as before.
+    """
+
+    if results is None:
+        return
+
+    by_cell: dict[tuple[uuid.UUID, str], list[TabularCellCitation]] = {}
+    for row in minted:
+        by_cell.setdefault((row.document_id, row.column_name), []).append(row)
+
+    for tab_row in results.rows:
+        for column_name, cell in tab_row.cells.items():
+            rows_for_cell = by_cell.get((tab_row.document_id, column_name), [])
+            cell.citations = [
+                Citation(
+                    citation_id=r.id,
+                    document_id=r.document_id,
+                    chunk_id=r.chunk_id,
+                    confidence=cell.confidence,
+                    verification_method=r.verification_method,
+                    source_offset_start=r.source_offset_start,
+                    source_offset_end=r.source_offset_end,
+                    verification_confidence=(
+                        float(r.verification_confidence)
+                        if r.verification_confidence is not None
+                        else None
+                    ),
+                )
+                for r in rows_for_cell
+            ]
+
+
+async def _enrich_cell_citations(db: AsyncSession, response: TabularExecutionResponse) -> None:
+    """Make tabular cell citations navigable by resolving their source.
+
+    The schema-level ``_synthesize_cell_citations`` validator builds each
+    :class:`Citation` purely from the cell's persisted ``cited_chunk_ids``
+    (real ``document_chunks.id`` UUIDs) with no DB access, so it can only
+    set ``document_id`` (a ``documents.id``) — not enough for the frontend
+    to navigate (its doc panel keys off ``files.id``). Here, where a DB
+    session is available, we enrich every cell citation in place with
+    ``source_file_id`` (``documents.file_id``), ``source_page``
+    (``document_chunks.page_start``), and ``source_text``
+    (``document_chunks.content``).
+
+    Resolution is batched — two ``IN`` queries total regardless of grid
+    size (no N+1): one over every cited chunk id across the whole grid,
+    then one over the documents those chunks belong to. Citations whose
+    ``chunk_id`` is missing (stale / hard-deleted chunk) are left with the
+    navigation fields unset rather than crashing.
+    """
+
+    if response.results is None:
+        return
+
+    all_citations: list[Citation] = [
+        citation
+        for tab_row in response.results.rows
+        for cell in tab_row.cells.values()
+        for citation in cell.citations
+    ]
+    chunk_ids = {c.chunk_id for c in all_citations if c.chunk_id is not None}
+    if not chunk_ids:
+        return
+
+    # Query 1: chunk id -> (document_id, page_start, content).
+    chunk_stmt = select(
+        DocumentChunk.id,
+        DocumentChunk.document_id,
+        DocumentChunk.page_start,
+        DocumentChunk.content,
+    ).where(DocumentChunk.id.in_(chunk_ids))
+    chunk_rows = (await db.execute(chunk_stmt)).all()
+    chunk_by_id = {cr.id: (cr.document_id, cr.page_start, cr.content) for cr in chunk_rows}
+
+    # Query 2: document id -> file_id.
+    document_ids = {doc_id for (doc_id, _page, _content) in chunk_by_id.values()}
+    file_by_document: dict[uuid.UUID, uuid.UUID] = {}
+    if document_ids:
+        doc_stmt = select(Document.id, Document.file_id).where(Document.id.in_(document_ids))
+        file_by_document = {dr.id: dr.file_id for dr in (await db.execute(doc_stmt)).all()}
+
+    for citation in all_citations:
+        if citation.chunk_id is None:
+            continue
+        resolved = chunk_by_id.get(citation.chunk_id)
+        if resolved is None:
+            continue  # stale chunk reference — leave navigation fields unset.
+        doc_id, page_start, content = resolved
+        citation.source_file_id = file_by_document.get(doc_id)
+        citation.source_page = page_start
+        citation.source_text = content
+
+
+def _to_summary(row: TabularExecution) -> TabularExecutionSummary:
+    """Compact list-endpoint projection."""
+
+    return TabularExecutionSummary.model_validate(
+        {
+            "id": row.id,
+            "user_id": row.user_id,
+            "parent_execution_id": row.parent_execution_id,
+            "skill_name": row.skill_name,
+            "status": row.status,
+            "document_count": len(row.document_ids),
+            "column_count": len(row.columns),
+            "cost_estimate_usd": row.cost_estimate_usd,
+            "cost_actual_usd": row.cost_actual_usd,
+            "created_at": row.created_at,
+            "completed_at": row.completed_at,
+        }
+    )
+
+
+__all__ = ["router"]
+
+
+async def _authorize_bulk_sources(db: AsyncSession, row: TabularBulkOp, user: ActiveUser) -> None:
+    ids = [
+        uuid.UUID(item["document_id"])
+        for item in (row.provenance or {}).get("documents", [])
+        if item.get("document_id")
+    ]
+    await require_document_matter_access(db, ids, user)

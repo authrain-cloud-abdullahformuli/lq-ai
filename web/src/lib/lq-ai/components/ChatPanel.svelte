@@ -1,0 +1,2086 @@
+<script context="module" lang="ts">
+	/**
+	 * Pure helpers for slash-invocation detection (Wave D.2 Task 7.1).
+	 *
+	 * Exposed from a `context="module"` block so vitest can exercise the
+	 * regex-based detection logic without mounting the (large) component.
+	 * Mirrors the convention SlashPopover uses for its keyboard-action
+	 * helpers.
+	 *
+	 * The detection contract:
+	 *   - The popover opens only when the slash sits at the start of a line
+	 *     (BOL or immediately after `\n`). Mid-line `/` (e.g., "and/or",
+	 *     "TCP/IP") does NOT open the popover.
+	 *   - Between the slash and the caret we accept the slash-alias
+	 *     character class (lowercase a-z, digits, hyphen) — matching the
+	 *     server-side `slash_alias` validator (Task 2.5). Any other char
+	 *     (whitespace, uppercase, underscore) terminates the candidate
+	 *     query and closes the popover.
+	 *   - Empty query is allowed (`/` alone opens the popover with the
+	 *     "no-query" empty state per SlashPopover.emptyStateKind()).
+	 */
+	export type SlashDetection = { open: false } | { open: true; query: string; slashIndex: number };
+
+	export function isAtLineStart(text: string, pos: number): boolean {
+		if (pos === 0) return true;
+		return text[pos - 1] === '\n';
+	}
+
+	export function detectSlashAt(text: string, caret: number): SlashDetection {
+		if (caret === 0) return { open: false };
+		// Walk left from the caret over the legal slash-alias char class.
+		let scan = caret;
+		while (scan > 0 && /[a-z0-9-]/.test(text[scan - 1])) scan--;
+		if (scan === 0 || text[scan - 1] !== '/') return { open: false };
+		const slashIndex = scan - 1;
+		if (!isAtLineStart(text, slashIndex)) return { open: false };
+		return {
+			open: true,
+			query: text.slice(slashIndex + 1, caret),
+			slashIndex
+		};
+	}
+
+	/**
+	 * Per-chat model-selection persistence (bugfix: model-selection-persist-
+	 * refresh). `modelByChat` was a component-local `Record` with no
+	 * persistence, so a full page refresh remounted the component, reset
+	 * modelByChat to `{}`, and currentModelId's reactive fallback silently
+	 * picked the picker's default — discarding the user's choice. Mirrors
+	 * ReceiptsDrawer.svelte's storageKeyForChat/readPersistedOpen/
+	 * writePersistedOpen convention (same file also uses a per-chat
+	 * localStorage key prefix, same optional injectable Storage param for
+	 * testability).
+	 *
+	 * All three helpers treat persistence as best-effort: a `Storage`
+	 * that throws (Safari private mode, a disabled-storage policy, a
+	 * quota-exceeded write) must never break chat selection, so the
+	 * read/write helpers swallow the exception and fall through to the
+	 * existing default-selection behaviour.
+	 */
+	const MODEL_STORAGE_KEY_PREFIX = 'lq_ai_chat_model_';
+
+	export function modelStorageKeyForChat(chatId: string): string {
+		return `${MODEL_STORAGE_KEY_PREFIX}${chatId}`;
+	}
+
+	export function readPersistedModel(chatId: string, storage?: Storage): string | null {
+		const store = storage ?? (typeof localStorage !== 'undefined' ? localStorage : null);
+		if (!store) return null;
+		try {
+			return store.getItem(modelStorageKeyForChat(chatId));
+		} catch {
+			return null;
+		}
+	}
+
+	export function writePersistedModel(chatId: string, modelId: string, storage?: Storage): void {
+		const store = storage ?? (typeof localStorage !== 'undefined' ? localStorage : null);
+		if (!store) return;
+		try {
+			store.setItem(modelStorageKeyForChat(chatId), modelId);
+		} catch {
+			/* best-effort: private-mode / quota / disabled storage — skip */
+		}
+	}
+
+	/**
+	 * Pure resolver for a chat's remembered model choice: return the
+	 * persisted id only when it is still in the supplied catalog.
+	 *
+	 * A model the operator has since removed from the gateway must not be
+	 * shown by the picker — `selectModel()` never ran for this session, so
+	 * `currentModelId` would surface the stale id while the send path
+	 * (`MessageCreate.model`) falls back to the default alias. The picker
+	 * would then display one model and the request would use another.
+	 * Gating on `availableIds` keeps the two in lockstep.
+	 */
+	export function readAvailablePersistedModel(
+		chatId: string,
+		availableIds: readonly string[],
+		storage?: Storage
+	): string | null {
+		const persisted = readPersistedModel(chatId, storage);
+		if (persisted === null) return null;
+		return availableIds.includes(persisted) ? persisted : null;
+	}
+</script>
+
+<script lang="ts">
+	/**
+	 * ChatPanel — reusable chat composition surface.
+	 *
+	 * Extracted from /lq-ai/chats/+page.svelte in Wave C Task 0 so that
+	 * /lq-ai/matters/[id] can mount the same surface inside the matter rail.
+	 *
+	 * Props:
+	 *   projectIdFilter  — when set, scopes the chat list to chats in this
+	 *                      project and hides the redundant project-filter UI
+	 *                      inside ChatSidebar.
+	 *   initialChatId    — when set, auto-selects that chat after loadShell().
+	 *
+	 * Layout: sidebar (left) | message list (centre) | attached-files panel (right).
+	 * Above the input: skill picker (multi-skill, with frontmatter input form).
+	 * Submit: streaming POST /messages, with applied-skills chips + tier badge
+	 * surfaced per-message.
+	 */
+	import { get } from 'svelte/store';
+	import { onDestroy, onMount } from 'svelte';
+	import { goto } from '$app/navigation';
+
+	import {
+		chatsApi,
+		filesApi,
+		messagesApi,
+		modelsApi,
+		projectsApi,
+		skillsApi
+	} from '$lib/lq-ai/api';
+	import type { ModelListResponse } from '$lib/lq-ai/api/models';
+	import { defaultSelection, groupModels } from '$lib/lq-ai/api/models';
+	import {
+		activeChatStore,
+		chatsByProject,
+		chatsStore,
+		messagesStore,
+		projectsStore,
+		skillsStore
+	} from '$lib/lq-ai/stores';
+	import { consumeMessageStream } from '$lib/lq-ai/sse/parser';
+	import { buildAuthorizeUrl, type PendingGate } from '$lib/lq-ai/chat/toolGate';
+	import {
+		canAttachChatFile,
+		createProcessingFileWarningHandler,
+		processingFileNames,
+		readyFileNames,
+		selectFileIdsForSend
+	} from '$lib/lq-ai/chat/attachedFiles';
+	import {
+		firstUnloadedSkillInputs,
+		flattenSkillInputs,
+		missingInputsMessage,
+		resolveSkillInputsForSend,
+		skillInputsUnavailableMessage
+	} from '$lib/lq-ai/chat/skillInputs';
+	import { orchestrationChatApi } from '$lib/lq-ai/api/orchestration';
+	import type {
+		OrchestrationChatRun,
+		RunDocumentsRead,
+		RunProfilesRead
+	} from '$lib/lq-ai/api/orchestration';
+	import {
+		ACTIVE_RUN_POLL_MS,
+		NEW_HARNESS_ID,
+		NEW_HARNESS_LABEL,
+		RESEND_NEEDS_MODEL,
+		answersDirectly,
+		buildStartBody,
+		candidateFileIds,
+		composerMode,
+		defaultDocumentSelection,
+		documentsReadSignature,
+		harnessOption,
+		minDocuments,
+		newRequestId,
+		proposeBlocker,
+		requestFor,
+		requestSignature,
+		sendWording,
+		syncActiveRun,
+		takesDocuments,
+		toggleDocument,
+		type PendingRequest
+	} from '$lib/lq-ai/run/composer';
+	import { chatHref } from '$lib/lq-ai/run/links';
+	import { fetchMessages, replaceMessage } from '$lib/lq-ai/run/thread';
+	import type { Chat, FileMeta, Message, Project, Skill } from '$lib/lq-ai/types';
+
+	import ChatSidebar from '$lib/lq-ai/components/ChatSidebar.svelte';
+	import AttachedFilesPanel from '$lib/lq-ai/components/AttachedFilesPanel.svelte';
+	import SkillPicker from '$lib/lq-ai/components/SkillPicker.svelte';
+	import ModelPicker from '$lib/lq-ai/components/ModelPicker.svelte';
+	import MessageList from '$lib/lq-ai/components/MessageList.svelte';
+	import TierBadge from '$lib/lq-ai/components/TierBadge.svelte';
+	import SavedPromptsPanel from '$lib/lq-ai/components/SavedPromptsPanel.svelte';
+	import AmbientFooter from '$lib/lq-ai/components/AmbientFooter.svelte';
+	import EnhancePromptExpansion from '$lib/lq-ai/components/EnhancePromptExpansion.svelte';
+	import AttachKBModal from '$lib/lq-ai/components/AttachKBModal.svelte';
+	import TierFloorOverrideModal from '$lib/lq-ai/components/TierFloorOverrideModal.svelte';
+	import ReceiptsDrawer, {
+		readPersistedOpen as readReceiptsDrawerOpen
+	} from '$lib/lq-ai/components/ReceiptsDrawer.svelte';
+	import SlashPopover from '$lib/lq-ai/components/SlashPopover.svelte';
+	import RunActiveNotice from '$lib/lq-ai/components/run/RunActiveNotice.svelte';
+	import RunDocumentPicker from '$lib/lq-ai/components/run/RunDocumentPicker.svelte';
+	import RunKnowledgeBases from '$lib/lq-ai/components/run/RunKnowledgeBases.svelte';
+	import RunModePanel from '$lib/lq-ai/components/run/RunModePanel.svelte';
+	import type { SkillAutocompleteItem } from '$lib/lq-ai/types';
+	import { auth } from '$lib/lq-ai/auth/store';
+	import { createEventDispatcher } from 'svelte';
+	import CompactPanel from './CompactPanel.svelte';
+	import LqButton from './shared/LqButton.svelte';
+	import LqSwitch from './shared/LqSwitch.svelte';
+	import LqGroup from './shared/LqGroup.svelte';
+	import LqText from './shared/LqText.svelte';
+	import LqTitle from './shared/LqTitle.svelte';
+	import LqAlert from './shared/LqAlert.svelte';
+	import { IconPaperclip, IconSparkles, IconListDetails } from '@tabler/icons-svelte';
+
+	// ---- component props ----
+	export let projectIdFilter: string | undefined = undefined;
+	export let initialChatId: string | undefined = undefined;
+
+	// ---- state ----
+	let activeProject: Project | null = null;
+	let archivedToggle = false;
+
+	// Per-chat draft state.
+	let composerText = '';
+	let attachedSkillNames: string[] = [];
+	let skillDetails: Record<string, Skill> = {};
+	let skillInputs: Record<string, Record<string, unknown>> = {};
+
+	// Wave D.2 Task 7.2 — per-attachment provenance.
+	// Parallel map keyed by slug (mirrors `attachedSkillNames`). Default
+	// ('picker') is applied at attach-time for any slug not already
+	// tagged, so picker-driven attaches and the slash flow are
+	// disambiguated for receipts/audit. Reset alongside
+	// `attachedSkillNames` whenever the chat changes. Plain Record
+	// (not Map) so Svelte 4 reactivity tracks the assignment.
+	let attachmentSources: Record<string, string> = {};
+
+	// Issue #207 finding 4 — opt-in "sticky skills" toggle. `stickyEnabled`
+	// mirrors the chat's persisted sticky set (on when non-empty). `stickyDirty`
+	// marks that the user flipped the toggle since the last send, so we send
+	// `set_sticky` ONLY on a real change — otherwise the backend leaves the set
+	// unchanged and just carries it forward (we must not re-snapshot every turn).
+	// `stickyInitChatId` tracks which chat we initialized from so a chat switch
+	// re-syncs the toggle without clobbering an in-progress toggle mid-chat.
+	let stickyEnabled = false;
+	let stickyDirty = false;
+	let stickyInitChatId: string | null = null;
+
+	// Wave D.1 T20 follow-on (deferral A + B) — Enhance Prompt tracking.
+	// `pendingEnhancement` holds the most recent "Use enhanced" outcome
+	// from EnhancePromptExpansion; we use it on send to (a) inject
+	// `'enhance-prompt'` into the user-message `skills[]` payload so
+	// `MessageResponse.is_enhanced` flips true (per ADR 0007), and (b)
+	// remember the original prompt the user typed before the skill
+	// expanded it so the ✨ enhanced pill can open a tap-to-diff modal.
+	// Map keyed by the persisted message id (resolved after the start
+	// frame) — the original is otherwise unrecoverable server-side
+	// because the user-message row stores only the enhanced content.
+	let pendingEnhancement: { original: string; enhanced: string } | null = null;
+	let enhancementOriginals: Record<string, string> = {};
+
+	// D0 — model picker state. `availableModels` holds the merged list from
+	// `GET /api/v1/models`; `modelByChat` persists the per-chat selection
+	// client-side (keyed by chat_id) so switching between chats doesn't
+	// reset the user's choice. `currentModelId` is the selection for the
+	// active chat, falling back to the picker's default when the chat has
+	// no remembered choice yet.
+	let availableModels: ModelListResponse = { object: 'list', data: [] };
+	let modelByChat: Record<string, string> = {};
+
+	let chatFiles: FileMeta[] = [];
+	let projectFiles: FileMeta[] = [];
+	let uploading = false;
+
+	// In-flight ingestion-status polls, keyed by file id, so detach, chat
+	// switch, and teardown can stop them (files attached in chat A must not
+	// keep polling — or get sent — after switching to chat B).
+	let filePollAborts: Record<string, AbortController> = {};
+
+	function abortFilePolls(): void {
+		for (const controller of Object.values(filePollAborts)) controller.abort();
+		filePollAborts = {};
+	}
+
+	onDestroy(abortFilePolls);
+
+	$: attachLimitReached = !canAttachChatFile(chatFiles.length);
+
+	let streamingMessageId: string | null = null;
+	let streamAbort: AbortController | null = null;
+	let sendError: string | null = null;
+	let attachmentWarning: string | null = null;
+	// Why the composer refused to send (a skill's inputs are missing or not
+	// loaded). Kept apart from `sendError` because it describes the form's
+	// current state: it is dropped as soon as the skills, their inputs or the
+	// attached files change, where a server error stays until the next send.
+	let inputsError: string | null = null;
+	$: attachedReadyNames = readyFileNames(chatFiles);
+	$: attachedProcessingNames = processingFileNames(chatFiles);
+	// Keyed on values, not array identity: the ingestion poll replaces
+	// `chatFiles` on every tick, which must not wipe a notice that says a
+	// file is still processing.
+	$: inputStateKey = JSON.stringify([
+		attachedSkillNames,
+		skillInputs,
+		attachedReadyNames,
+		attachedProcessingNames
+	]);
+	$: {
+		void inputStateKey;
+		inputsError = null;
+	}
+	// Attached skills whose detail or input schema failed to load.
+	let failedSkillNames: string[] = [];
+
+	// PR6b — governed tool-loop gate. When the stream pauses on a
+	// `tool_confirmation_required` or `mcp_authorization_required` terminal
+	// frame, `pendingGate` holds the gate keyed to the assistant message whose
+	// turn paused; the resume/connect handlers act on it. `gateBusy` disables
+	// the card's buttons while a resume POST is in flight. Both reset whenever a
+	// new stream starts for that message (see `consumeIntoMessage`).
+	let pendingGate: PendingGate | null = null;
+	let gateBusy = false;
+
+	// T6 — Enhance Prompt panel reference. Parent calls expansionPanel.open().
+	let expansionPanel: EnhancePromptExpansion | null = null;
+
+	// T12 — Attach-KB modal state. The composer's attach-KB button (IconPaperclip)
+	// mounts the shared AttachKBModal scoped to the active chat's project.
+	// Successful attaches bubble up to the matter workspace via the
+	// `kbsAttached` event so the matter rail can refresh its KB list. The
+	// modal is only meaningful when the active chat lives inside a project
+	// (legal matter); for project-less chats the button is hidden.
+	let attachKbModalOpen = false;
+	const dispatch = createEventDispatcher<{ kbsAttached: { kbIds: string[] } }>();
+
+	// Wave D.1 T19 — Receipts drawer state. The composer's receipts button
+	// (IconListDetails) toggles the right-side receipts drawer (T18). Open
+	// state is restored from localStorage when the active chat changes, so
+	// it survives reloads and chat switches.
+	let receiptsDrawerOpen = false;
+
+	function openAttachKbModal(): void {
+		attachKbModalOpen = true;
+	}
+
+	function closeAttachKbModal(): void {
+		attachKbModalOpen = false;
+	}
+
+	async function handleKbsAttached(kbIds: string[]): Promise<void> {
+		attachKbModalOpen = false;
+		// Refresh the local projects-store entry so the modal's "currently
+		// attached" badge + the matter rail's KB list see the new ids without
+		// waiting for a chat re-select. The parent matter page also listens
+		// to `kbsAttached` and re-fetches the matter top-level for routes
+		// that hold matter state of their own.
+		const projectId = composerProjectId;
+		if (projectId) {
+			try {
+				const updated = await projectsApi.getProject(projectId);
+				projectsStore.update(($projects) =>
+					$projects.map((p) => (p.id === updated.id ? updated : p))
+				);
+			} catch (e) {
+				console.error('lq-ai: failed to refresh project after KB attach', e);
+			}
+		}
+		dispatch('kbsAttached', { kbIds });
+	}
+
+	// Wave D.1 T15 — refusal-bubble flow. ChatPanel owns the override-modal
+	// state and the three per-message callbacks (re-run, override-requested,
+	// explainer). On override success the refusal row is replaced in-place by
+	// the new kind='ai' Message; admin-only override is enforced by the
+	// RefusalMessageBubble's showOverrideButton(role) helper — we still pass
+	// the real role here so members/viewers never see the button at all.
+	let overrideModalOpen = false;
+	let overrideMessage: Message | null = null;
+
+	function handleRefusalOverrideRequested(msg: Message): void {
+		overrideMessage = msg;
+		overrideModalOpen = true;
+	}
+
+	function closeOverrideModal(): void {
+		overrideModalOpen = false;
+		overrideMessage = null;
+	}
+
+	function handleRefusalRerun(msg: Message): void {
+		// Find the immediately-preceding user message and re-dispatch its
+		// content through the existing sendMessage() flow. Re-using the
+		// composer path keeps streaming + applied-skills + model selection
+		// consistent with a normal turn. Future: surface a "re-running…"
+		// indicator on the refusal row while the stream is in flight.
+		// This sends an ordinary message again. Beside New harness, Send starts a
+		// run, which is not what was asked for.
+		if (harnessChosen) {
+			sendError = RESEND_NEEDS_MODEL;
+			return;
+		}
+		const list = get(messagesStore);
+		const idx = list.findIndex((m) => m.id === msg.id);
+		if (idx <= 0) return;
+		for (let i = idx - 1; i >= 0; i--) {
+			const candidate = list[i];
+			const isUser = candidate.kind === 'user' || candidate.role === 'user';
+			if (isUser && candidate.content) {
+				composerText = candidate.content;
+				void sendChatMessage();
+				return;
+			}
+		}
+	}
+
+	function handleRefusalExplainerRequested(_msg: Message): void {
+		// JIT explainer for the tier-floor refusal. M1 surfaces the trust
+		// page anchor; v1.1+ may swap to an inline modal carrying the §7.4
+		// copy without leaving the chat.
+		if (typeof window !== 'undefined') {
+			window.open('/lq-ai/trust#tier-floors', '_blank', 'noopener');
+		}
+	}
+
+	function handleOverrideSuccess(newAiMessage: Message): void {
+		// Replace the refusal row in-place so the operator's mental model
+		// (one turn → one bubble) survives the override path. The new
+		// kind='ai' Message carries the routed_inference_tier + provider, so
+		// the assistant rendering path takes over for that slot.
+		const replacing = overrideMessage;
+		if (replacing) {
+			messagesStore.update(($m) => $m.map((m) => (m.id === replacing.id ? newAiMessage : m)));
+		}
+		closeOverrideModal();
+	}
+
+	// ---- governed runs (ADR 0038 D1) ----
+	// A run is a governed task: a model proposes a plan, the owner approves that exact
+	// plan, and tasks run under it. The thread shows it as a message (RunMessage); the
+	// composer starts it when New harness is the chat's model. With an ordinary model
+	// chosen, nothing below changes how a message
+	// is sent.
+	let runProfiles: RunProfilesRead | null = null;
+	let runProfilesChatId: string | null = null;
+	let runProfilesLoading = false;
+	// Whether a read for the active chat has finished, with or without a result.
+	// Until it has, a chat whose model is New harness waits instead of sending.
+	let runProfilesChecked = false;
+	let runProfilesError: string | null = null;
+	let runDocuments: RunDocumentsRead | null = null;
+	let runDocumentsLoading = false;
+	let runDocumentsError: string | null = null;
+	// What the document list was last read for; null until it is read (and again after
+	// New harness is chosen or the chat changes). A change in the chat's attached files makes it stale.
+	let runDocumentsSignature: string | null = null;
+	let runDocumentsTicket = 0;
+	let selectedDocumentIds: string[] = [];
+	// Whether the person has ticked or unticked a document in this draft. Until they have,
+	// the selection is the default one (`defaultDocumentSelection`); after, it is theirs.
+	let selectionTouched = false;
+	// Counts the drafts, so the document picker is drawn afresh (and decides again whether it
+	// starts open) for each one.
+	let draftNumber = 0;
+	// The request being proposed. Kept until it succeeds, so a retry after a lost
+	// response returns the same run instead of starting a second one.
+	let runRequest: PendingRequest | null = null;
+	// The chats whose request is on its way. Kept per chat: a request in flight in one chat
+	// neither labels nor blocks Send in another.
+	let proposingChats: ReadonlySet<string> = new Set();
+	$: proposing = activeChat ? proposingChats.has(activeChat.id) : false;
+	let closingActiveRun = false;
+	let activeRunError: string | null = null;
+
+	/**
+	 * Read which profiles this chat can start, and which run holds the owner's
+	 * allowance. A quiet read is the background refresh while a run is active: it
+	 * shows no loading state, and a failure leaves what is shown as it is.
+	 */
+	async function loadRunProfiles(chatId: string, options: { quiet?: boolean } = {}): Promise<void> {
+		const quiet = options.quiet === true;
+		if (!quiet) runProfilesLoading = true;
+		try {
+			const value = await orchestrationChatApi.runProfiles(chatId);
+			if (chatId !== runProfilesChatId) return;
+			runProfiles = value;
+			runProfilesError = null;
+			runProfilesChecked = true;
+		} catch (e) {
+			if (chatId !== runProfilesChatId || quiet) return;
+			if ((e as { status?: number } | null)?.status === 404) {
+				// An API without the route has no runs to offer: no control, not a dead one.
+				runProfiles = null;
+				runProfilesError = null;
+			} else {
+				runProfilesError = e instanceof Error ? e.message : String(e);
+			}
+			runProfilesChecked = true;
+		} finally {
+			if (!quiet && chatId === runProfilesChatId) runProfilesLoading = false;
+		}
+	}
+
+	// While a run holds the owner's allowance, the notice about it is kept current:
+	// at once from the run's own message when that is in this thread, and by a slow
+	// read otherwise, so a run in another chat is seen to move on and to end.
+	let activeRunTimer: ReturnType<typeof setInterval> | undefined;
+
+	function stopActiveRunPoll(): void {
+		clearInterval(activeRunTimer);
+		activeRunTimer = undefined;
+	}
+
+	function startActiveRunPoll(): void {
+		if (activeRunTimer !== undefined) return;
+		activeRunTimer = setInterval(() => {
+			if (typeof document !== 'undefined' && document.hidden) return;
+			if (runProfilesChatId && !runProfilesLoading) {
+				void loadRunProfiles(runProfilesChatId, { quiet: true });
+			}
+		}, ACTIVE_RUN_POLL_MS);
+	}
+
+	onDestroy(stopActiveRunPoll);
+
+	/** Every read of a run shown in this thread: keep the composer's notice in step. */
+	function handleRunUpdate(_message: Message, run: OrchestrationChatRun): void {
+		if (runProfiles) runProfiles = syncActiveRun(runProfiles, run);
+	}
+
+	/** Forget the document list and selection: they belong to one chat's draft. */
+	function resetRunDraft(): void {
+		selectedDocumentIds = [];
+		selectionTouched = false;
+		draftNumber += 1;
+		runDocuments = null;
+		runDocumentsError = null;
+		runDocumentsSignature = null;
+		runDocumentsTicket += 1;
+		runDocumentsLoading = false;
+	}
+
+	/**
+	 * The draft ends when its request is sent. The next one starts from the default
+	 * selection again, and the list is read again so that the run just started, now the
+	 * last in this chat, is the one it is suggested from.
+	 */
+	function endRunDraft(): void {
+		selectedDocumentIds = [];
+		selectionTouched = false;
+		draftNumber += 1;
+		runDocumentsSignature = null;
+	}
+
+	async function loadRunDocuments(): Promise<void> {
+		const chat = $activeChatStore;
+		if (!chat) return;
+		// Recorded before the read, so a failed read is not retried in a loop; the
+		// picker's refresh button reads again on demand.
+		runDocumentsSignature = documentsReadSignature(chatFiles, composerAttachedKbIds);
+		// The chat's own files as they were when the read was asked for.
+		const attached = candidateFileIds(chatFiles);
+		const ticket = ++runDocumentsTicket;
+		runDocumentsLoading = true;
+		runDocumentsError = null;
+		try {
+			const value = await orchestrationChatApi.runDocuments(chat.id, attached);
+			if (ticket !== runDocumentsTicket) return;
+			runDocuments = value;
+			// Until the person changes the selection, it is the default one; after, it is
+			// theirs, and only loses what is no longer listed or readable.
+			selectedDocumentIds = defaultDocumentSelection({
+				read: value,
+				attachedFileIds: attached,
+				selected: selectedDocumentIds,
+				touched: selectionTouched
+			});
+		} catch (e) {
+			if (ticket !== runDocumentsTicket) return;
+			runDocumentsError = e instanceof Error ? e.message : String(e);
+		} finally {
+			if (ticket === runDocumentsTicket) runDocumentsLoading = false;
+		}
+	}
+
+	function toggleRunDocument(fileId: string): void {
+		selectionTouched = true;
+		selectedDocumentIds = toggleDocument(
+			selectedDocumentIds,
+			fileId,
+			runDocuments?.max_documents ?? selectedRunProfile?.max_documents ?? 8
+		);
+	}
+
+	/** Read the chat's thread again, so the user's request and the run's message appear. */
+	async function reloadThread(chatId: string): Promise<boolean> {
+		try {
+			const items = await fetchMessages((cursor) =>
+				messagesApi.listMessages(chatId, { limit: 100, cursor })
+			);
+			if ($activeChatStore?.id === chatId && !streamingMessageId) messagesStore.set(items);
+			return true;
+		} catch (e) {
+			console.error('lq-ai: failed to reload messages', e);
+			return false;
+		}
+	}
+
+	async function proposeRun(): Promise<void> {
+		const chat = $activeChatStore;
+		const profile = selectedRunProfile;
+		if (!chat || proposingChats.has(chat.id)) return;
+		if (!profile) {
+			// New harness is the chat's model but cannot be used right now. Say why;
+			// never send the request to some other model instead.
+			sendError = harnessBlock ?? proposeBlocker({ profile: null, goal: '', selectedCount: 0 });
+			return;
+		}
+		const goal = composerText.trim();
+		const blocked = proposeBlocker({
+			profile,
+			goal,
+			selectedCount: selectedDocumentIds.length
+		});
+		if (blocked) {
+			sendError = blocked;
+			return;
+		}
+		const fileIds = takesDocuments(profile) ? [...selectedDocumentIds] : [];
+		// The same request keeps its id; a changed one gets a new id (the server refuses
+		// an id reused with different input).
+		const request = requestFor(
+			runRequest,
+			requestSignature({ chatId: chat.id, profile: profile.profile, goal, fileIds }),
+			newRequestId
+		);
+		runRequest = request;
+		sendError = null;
+		proposingChats = new Set([...proposingChats, chat.id]);
+		try {
+			await orchestrationChatApi.startRun(
+				chat.id,
+				buildStartBody({ requestId: request.id, profile, goal, fileIds })
+			);
+			runRequest = null;
+			// New harness stays the chat's model, as any model does after Send. The draft
+			// is over: the next one starts from the default selection.
+			if ($activeChatStore?.id === chat.id) {
+				// Only what was sent is cleared: text typed while the request was on its way stays.
+				if (composerText.trim() === goal) composerText = '';
+				endRunDraft();
+			}
+			const refreshed = await reloadThread(chat.id);
+			if (!refreshed && $activeChatStore?.id === chat.id) {
+				sendError =
+					'The run was started, but this thread could not be refreshed. Reload the chat to see it.';
+			}
+			await loadRunProfiles(chat.id);
+		} catch (e) {
+			// The request id is kept, so pressing Send again is a retry of this request.
+			// The error belongs to the chat it was sent from, not to one opened since.
+			if ($activeChatStore?.id === chat.id) {
+				sendError = e instanceof Error ? e.message : sendWording(answersDirectly(profile)).failure;
+			}
+			void loadRunProfiles(chat.id);
+		} finally {
+			const rest = new Set(proposingChats);
+			rest.delete(chat.id);
+			proposingChats = rest;
+		}
+	}
+
+	/** A run in this thread reached a finished state: read its row again, then the profiles. */
+	async function handleRunSettled(message: Message, _run: OrchestrationChatRun): Promise<void> {
+		const chatId = message.chat_id;
+		try {
+			const items = await fetchMessages(
+				(cursor) => messagesApi.listMessages(chatId, { limit: 100, cursor }),
+				{ stopAtId: message.id }
+			);
+			const fresh = items.find((m) => m.id === message.id);
+			if (fresh && $activeChatStore?.id === chatId) {
+				messagesStore.update(($m) => replaceMessage($m, fresh));
+			}
+		} catch (e) {
+			console.error('lq-ai: failed to refresh a run message', e);
+		}
+		if ($activeChatStore?.id === chatId) await loadRunProfiles(chatId);
+	}
+
+	async function closeActiveRun(): Promise<void> {
+		const active = runProfiles?.active_run;
+		const chat = $activeChatStore;
+		if (!active || !chat || closingActiveRun) return;
+		closingActiveRun = true;
+		activeRunError = null;
+		try {
+			await orchestrationChatApi.close(active.root_id);
+		} catch (e) {
+			activeRunError = e instanceof Error ? e.message : 'Could not close the run.';
+		} finally {
+			closingActiveRun = false;
+		}
+		await loadRunProfiles(chat.id);
+	}
+
+	async function openActiveRunChat(): Promise<void> {
+		const chatId = runProfiles?.active_run?.chat_id;
+		if (!chatId) return;
+		const known = get(chatsStore).find((c) => c.id === chatId);
+		if (known && (!projectIdFilter || known.project_id === projectIdFilter)) {
+			await selectChat(known);
+			return;
+		}
+		if (!projectIdFilter) {
+			try {
+				await selectChat(await chatsApi.getChat(chatId));
+				return;
+			} catch (e) {
+				console.error('lq-ai: failed to open the chat holding the active run', e);
+			}
+		}
+		await goto(chatHref(chatId));
+	}
+
+	// ---- bootstrap ----
+	async function loadShell() {
+		try {
+			const [projects, chatsPage, skills] = await Promise.all([
+				projectsApi.listProjects(),
+				chatsApi.listAllChats(projectIdFilter ? { project_id: projectIdFilter } : {}),
+				skillsApi.listSkills()
+			]);
+			projectsStore.set(projects);
+			chatsStore.set(chatsPage);
+			skillsStore.set(skills);
+		} catch (e) {
+			console.error('lq-ai: bootstrap load failed', e);
+		}
+		// D0 — model list. Best-effort: if the gateway is unreachable the
+		// picker shows an empty state and the composer falls back to the
+		// "smart" alias on send so the chat still works.
+		try {
+			availableModels = await modelsApi.listModels();
+		} catch (e) {
+			console.error('lq-ai: model list load failed', e);
+			availableModels = { object: 'list', data: [] };
+		}
+	}
+
+	function selectModel(id: string): void {
+		const chat = $activeChatStore;
+		if (!chat) return;
+		const wasHarness = modelByChat[chat.id] === NEW_HARNESS_ID;
+		modelByChat = { ...modelByChat, [chat.id]: id };
+		writePersistedModel(chat.id, id);
+		if (wasHarness !== (id === NEW_HARNESS_ID)) {
+			// Entering or leaving New harness: neither draft carries over. Skills,
+			// "Keep skills on" and the enhancer are not shown beside New harness.
+			resetRunDraft();
+			runRequest = null;
+			sendError = null;
+			inputsError = null;
+			pendingEnhancement = null;
+			onSlashDismiss();
+		}
+	}
+
+	async function selectChat(chat: Chat) {
+		activeChatStore.set(chat);
+		streamingMessageId = null;
+		sendError = null;
+		attachmentWarning = null;
+		// An open slash popover listens on the window; it must not outlive its chat.
+		onSlashDismiss();
+		// Reset draft state.
+		composerText = '';
+		attachedSkillNames = [];
+		failedSkillNames = [];
+		attachmentSources = {};
+		skillInputs = {};
+		// Attached files are per-chat draft state too — reset them (and stop
+		// their status polls) so chat A's files are never sent from chat B.
+		abortFilePolls();
+		chatFiles = [];
+		// Hydrate this chat's remembered model choice from localStorage if we
+		// don't already have one in-memory (survives a page refresh; a
+		// same-session choice already in modelByChat always wins). Only accept
+		// a persisted id the current catalog still offers, so the picker can
+		// never show a model the send path would silently drop.
+		if (!(chat.id in modelByChat)) {
+			// New harness is offered by the run-profiles read, not the gateway's
+			// catalog; whether it can be used in this chat is decided when that
+			// read returns (see `mode`).
+			const persisted = readAvailablePersistedModel(chat.id, [
+				...availableModels.data.map((m) => m.id),
+				NEW_HARNESS_ID
+			]);
+			if (persisted) {
+				modelByChat = { ...modelByChat, [chat.id]: persisted };
+			}
+		}
+		// Load messages.
+		try {
+			const page = await messagesApi.listMessages(chat.id, { limit: 100 });
+			messagesStore.set(page.items);
+		} catch (e) {
+			console.error('lq-ai: failed to load messages', e);
+			messagesStore.set([]);
+		}
+		// Load attached project skills/files context.
+		await refreshProjectContext(chat);
+	}
+
+	async function refreshProjectContext(chat: Chat) {
+		projectFiles = [];
+		if (!chat.project_id) return;
+		try {
+			const project = await projectsApi.getProject(chat.project_id);
+			// Update the projects-store entry too.
+			projectsStore.update(($projects) =>
+				$projects.map((p) => (p.id === project.id ? project : p))
+			);
+			// Project-attached files are surfaced read-only per Project context inheritance.
+			if (project.attached_file_ids && project.attached_file_ids.length > 0) {
+				projectFiles = await Promise.all(
+					project.attached_file_ids.map((id) => filesApi.getFile(id).catch(() => null))
+				).then((items) => items.filter((x): x is FileMeta => x !== null));
+			}
+		} catch (e) {
+			console.error('lq-ai: failed to load project context', e);
+		}
+	}
+
+	async function createNewChat() {
+		try {
+			const chat = await chatsApi.createChat({
+				project_id: projectIdFilter ?? activeProject?.id ?? null
+			});
+			chatsStore.update(($chats) => [chat, ...$chats]);
+			selectChat(chat);
+		} catch (e) {
+			console.error('lq-ai: failed to create chat', e);
+		}
+	}
+
+	function selectProject(project: Project | null) {
+		activeProject = project;
+	}
+
+	function toggleArchived(next: boolean) {
+		archivedToggle = next;
+		// M1: archived listing reload. Per the backend OpenAPI sketch, omitting
+		// `archived` is equivalent to `archived=false`; `archived=true` returns
+		// archived rows only. So when the operator flips the toggle on we pass
+		// `archived: true`; when off, we omit the flag.
+		const baseOpts = projectIdFilter ? { project_id: projectIdFilter } : {};
+		Promise.all([
+			projectsApi.listProjects(next ? { archived: true } : {}),
+			chatsApi.listAllChats(next ? { ...baseOpts, archived: true } : baseOpts)
+		])
+			.then(([p, c]) => {
+				projectsStore.set(p);
+				chatsStore.set(c);
+			})
+			.catch((e) => console.error('lq-ai: archive toggle reload failed', e));
+	}
+
+	// ---- skill picker handlers ----
+	async function attachSkill(name: string) {
+		if (attachedSkillNames.includes(name)) return;
+		// Wave D.2 Task 7.2 — default attach provenance to 'picker'. The
+		// slash-invocation flow (onSlashSelect) pre-tags the slug with
+		// 'slash' BEFORE calling attachSkill, so this default only fires
+		// for SkillPicker-driven attaches. Don't overwrite an existing
+		// tag — that would silently demote 'slash' to 'picker' in any
+		// future re-entrant attach path.
+		if (!attachmentSources[name]) {
+			attachmentSources = { ...attachmentSources, [name]: 'picker' };
+		}
+		attachedSkillNames = [...attachedSkillNames, name];
+		await loadSkillDetail(name);
+	}
+
+	// Also the picker's Retry handler. Send is blocked until this has
+	// succeeded for every attached skill: without the schema the composer
+	// cannot tell which inputs the gateway will insist on.
+	async function loadSkillDetail(name: string) {
+		failedSkillNames = failedSkillNames.filter((n) => n !== name);
+		try {
+			// The form schema comes from the api's own resolver (user > team >
+			// built-in, both frontmatter shapes) so the form and the gateway's
+			// required-input check read the same declaration.
+			const [detail, inputs] = await Promise.all([
+				skillsApi.getSkill(name),
+				skillsApi.getInputs(name)
+			]);
+			skillDetails = {
+				...skillDetails,
+				[name]: { ...detail, inputs: flattenSkillInputs(inputs) }
+			};
+		} catch (e) {
+			console.error('lq-ai: failed to load skill detail', e);
+			// Detached (or the chat changed) while loading: nothing to flag.
+			if (attachedSkillNames.includes(name) && !failedSkillNames.includes(name)) {
+				failedSkillNames = [...failedSkillNames, name];
+			}
+		}
+	}
+
+	function detachSkill(name: string) {
+		attachedSkillNames = attachedSkillNames.filter((n) => n !== name);
+		failedSkillNames = failedSkillNames.filter((n) => n !== name);
+		const next = { ...skillInputs };
+		delete next[name];
+		skillInputs = next;
+		// Wave D.2 Task 7.2 — drop the parallel provenance entry so a
+		// re-attach starts fresh (and so the map doesn't accumulate
+		// orphaned slugs across the lifetime of a chat).
+		const nextSources = { ...attachmentSources };
+		delete nextSources[name];
+		attachmentSources = nextSources;
+	}
+
+	function updateSkillInputs(name: string, values: Record<string, unknown>) {
+		skillInputs = { ...skillInputs, [name]: values };
+	}
+
+	// ---- file panel handlers ----
+	async function uploadAttached(file: File) {
+		// The backend 422s the whole send when file_ids exceeds the cap
+		// (MESSAGE_FILE_IDS_MAX_LEN), so block the attach up front; the panel
+		// shows the limit notice + disables the upload button in parallel.
+		if (!canAttachChatFile(chatFiles.length)) return;
+		// The active chat can change while the upload is in flight; capture the
+		// target so chat A's file is never appended to (or sent from) chat B.
+		const targetChatId = $activeChatStore?.id ?? null;
+		uploading = true;
+		try {
+			const uploaded = await filesApi.uploadFile(file, {
+				project_id: $activeChatStore?.project_id ?? undefined
+			});
+			// Re-check after the await: the chat may have changed, and a
+			// parallel upload may have taken the last slot under the cap.
+			if (($activeChatStore?.id ?? null) !== targetChatId) return;
+			if (!canAttachChatFile(chatFiles.length)) return;
+			chatFiles = [...chatFiles, uploaded];
+			// Ingestion is async; poll so the chip flips pending -> ready (or
+			// failed) instead of showing a stale "pending" forever.
+			void pollAttachedStatus(uploaded.id);
+		} catch (e) {
+			console.error('lq-ai: upload failed', e);
+		} finally {
+			uploading = false;
+		}
+	}
+
+	// Poll a chat-attached file's ingestion status until it reaches a terminal
+	// state, patching the matching chatFiles entry so the panel chip updates.
+	// The per-file AbortController stops the loop on detach, chat switch, and
+	// component teardown (abortFilePolls / onDestroy).
+	async function pollAttachedStatus(id: string): Promise<void> {
+		const controller = new AbortController();
+		filePollAborts[id]?.abort();
+		filePollAborts = { ...filePollAborts, [id]: controller };
+		const result = await filesApi.pollFileStatus(id, {
+			signal: controller.signal,
+			onStatus: (latest) => {
+				chatFiles = chatFiles.map((f) =>
+					f.id === id ? { ...f, ingestion_status: latest.ingestion_status } : f
+				);
+			}
+		});
+		if (filePollAborts[id] === controller) {
+			const next = { ...filePollAborts };
+			delete next[id];
+			filePollAborts = next;
+		}
+		if (result.outcome === 'timeout') {
+			// Leave the last known status in place — don't fabricate 'failed'.
+			console.warn('lq-ai: file ingestion status poll timed out', id);
+		}
+	}
+
+	async function detachFile(file: FileMeta) {
+		// Per the spec the M1 attached-files panel manages chat-local state;
+		// the full file-row is left in place and can be re-attached later.
+		filePollAborts[file.id]?.abort();
+		chatFiles = chatFiles.filter((f) => f.id !== file.id);
+	}
+
+	// ---- send + stream ----
+
+	/**
+	 * Consume one SSE stream into a single assistant message bubble. Shared by
+	 * the initial send and the resume-after-confirmation POST so a chained gate
+	 * (the resumed turn pausing again) is handled identically. `assistantId0` is
+	 * the message id the stream should write into — the optimistic draft id on
+	 * the initial send (reconciled to the persisted id on `start`), or the
+	 * already-persisted id on a resume.
+	 */
+	async function consumeIntoMessage(
+		body: ReadableStream<Uint8Array>,
+		assistantId0: string,
+		processingFileIds: string[] = []
+	): Promise<void> {
+		let assistantId = assistantId0;
+		const warnForProcessingFile = createProcessingFileWarningHandler(
+			processingFileIds,
+			() => $activeChatStore?.id,
+			(warning) => {
+				attachmentWarning = warning;
+			}
+		);
+		await consumeMessageStream(body, {
+			onStart: (frame) => {
+				// Reconcile the optimistic draft id with the persisted id on the
+				// initial send; on resume the id is already persisted so this is a
+				// no-op remap.
+				const newId = frame.lq_ai_message_id;
+				if (newId !== assistantId) {
+					const prev = assistantId;
+					messagesStore.update(($m) => $m.map((m) => (m.id === prev ? { ...m, id: newId } : m)));
+					assistantId = newId;
+				}
+				streamingMessageId = assistantId;
+				// A fresh stream supersedes any prior gate card on this message.
+				pendingGate = null;
+			},
+			onDelta: (frame) => {
+				messagesStore.update(($m) =>
+					$m.map((m) =>
+						m.id === assistantId
+							? {
+									...m,
+									content: (m.content ?? '') + frame.delta,
+									routed_inference_tier: frame.routed_inference_tier ?? m.routed_inference_tier,
+									applied_skills: frame.applied_skills ?? m.applied_skills
+								}
+							: m
+					)
+				);
+			},
+			onComplete: (frame) => {
+				streamingMessageId = null;
+				warnForProcessingFile(frame);
+				messagesStore.update(($m) =>
+					$m.map((m) =>
+						m.id === assistantId
+							? {
+									...m,
+									...frame.message,
+									applied_skills: frame.applied_skills ?? frame.message.applied_skills,
+									routed_inference_tier:
+										frame.routed_inference_tier ?? frame.message.routed_inference_tier,
+									routed_provider: frame.routed_provider ?? frame.message.routed_provider,
+									citations: frame.citations ?? frame.message.citations ?? []
+								}
+							: m
+					)
+				);
+			},
+			onError: (frame) => {
+				streamingMessageId = null;
+				sendError = `${frame.error.code}: ${frame.error.message}`;
+				messagesStore.update(($m) =>
+					$m.map((m) => (m.id === assistantId ? { ...m, error_code: frame.error.code } : m))
+				);
+			},
+			onToolConfirmation: (frame) => {
+				streamingMessageId = null;
+				pendingGate = { assistantId, kind: 'confirm', frame };
+			},
+			onMcpAuthorization: (frame) => {
+				streamingMessageId = null;
+				pendingGate = { assistantId, kind: 'connect', frame };
+			}
+		});
+	}
+
+	/** Send, from the button. With New harness as the chat's model it asks for a plan. */
+	async function sendMessage() {
+		if (harnessChosen) {
+			await proposeRun();
+			return;
+		}
+		await sendChatMessage();
+	}
+
+	/**
+	 * One ordinary chat turn to the chat's provider model. It refuses beside New
+	 * harness, so the harness id is never sent as a model and a request made to New
+	 * harness is never answered by another model.
+	 */
+	async function sendChatMessage() {
+		const chat = $activeChatStore;
+		if (!chat || harnessChosen) return;
+		if (!composerText.trim()) return;
+
+		// Hold the send until every attached skill's input schema is on hand.
+		const inputDefs = Object.fromEntries(
+			attachedSkillNames.map((n) => [n, skillDetails[n]?.inputs])
+		);
+		const unloaded = firstUnloadedSkillInputs(attachedSkillNames, inputDefs, failedSkillNames);
+		if (unloaded) {
+			sendError = null;
+			inputsError = skillInputsUnavailableMessage(
+				skillDetails[unloaded.skill]?.title ?? unloaded.skill,
+				unloaded.loadFailed
+			);
+			return;
+		}
+
+		// Validate required skill inputs and build the payload. A required
+		// document input left empty is bound to the ready attached files' names.
+		const resolvedInputs = resolveSkillInputsForSend(
+			attachedSkillNames,
+			inputDefs,
+			skillInputs,
+			attachedReadyNames
+		);
+		if (resolvedInputs.missing.length > 0) {
+			const first = resolvedInputs.missing[0];
+			sendError = null;
+			inputsError = missingInputsMessage(
+				first,
+				skillDetails[first.skill]?.title,
+				attachedProcessingNames
+			);
+			return;
+		}
+
+		sendError = null;
+		attachmentWarning = null;
+		// Clear any prior gate card up front: a new turn supersedes a stranded
+		// gate even if this send throws before the stream's `onStart` fires.
+		pendingGate = null;
+
+		// Wave D.1 T20 follow-on: if the operator clicked "Use enhanced"
+		// and the composer still holds the AI-enhanced text, inject
+		// `'enhance-prompt'` into the skills payload so the persisted
+		// user-message row carries it in `applied_skills` (ADR 0007
+		// denormalization). `message_to_response` then flips
+		// `is_enhanced=true`, which MessageBubble keys the ✨ pill off.
+		// We also remember the original text keyed by the enhanced
+		// content so the tap-to-diff modal can recover it; session-only
+		// (lost on reload — the server stores only the enhanced text).
+		const sentSkillsForUser = [...attachedSkillNames];
+		let isEnhancedSend = false;
+		if (pendingEnhancement && pendingEnhancement.enhanced === composerText) {
+			isEnhancedSend = true;
+			if (!sentSkillsForUser.includes('enhance-prompt')) {
+				sentSkillsForUser.push('enhance-prompt');
+			}
+			enhancementOriginals = {
+				...enhancementOriginals,
+				[composerText]: pendingEnhancement.original
+			};
+		}
+
+		// Optimistically append the user message; the persisted row will
+		// supersede it once the start frame arrives.
+		const optimisticUserId = `optimistic-${Date.now()}`;
+		const userMsg: Message = {
+			id: optimisticUserId,
+			chat_id: chat.id,
+			role: 'user',
+			content: composerText,
+			applied_skills: sentSkillsForUser,
+			is_enhanced: isEnhancedSend,
+			created_at: new Date().toISOString()
+		};
+		messagesStore.update(($m) => [...$m, userMsg]);
+
+		const draftAssistantId = `draft-${Date.now()}`;
+		const assistantMsg: Message = {
+			id: draftAssistantId,
+			chat_id: chat.id,
+			role: 'assistant',
+			content: '',
+			applied_skills: [],
+			created_at: new Date().toISOString()
+		};
+		messagesStore.update(($m) => [...$m, assistantMsg]);
+		streamingMessageId = draftAssistantId;
+
+		streamAbort = new AbortController();
+
+		// Wave D.2 Task 7.2 — send via the rich `attached_skills` shape so
+		// per-attachment provenance (slash vs picker) reaches the backend
+		// for receipts/audit attribution. The legacy `skills: list[str]`
+		// field is dropped — both formats are accepted in parallel by the
+		// API (api/app/schemas/chats.py: AttachedSkillRef + dedupe), and
+		// `attached_skills` is the canonical Wave D.2 surface. Slugs not
+		// in `attachmentSources` (defensive — shouldn't happen since
+		// attachSkill() seeds 'picker') fall back to 'picker' so audit
+		// records always carry a source.
+		const attachedSkillsPayload = sentSkillsForUser.map((slug) => ({
+			slug,
+			source: attachmentSources[slug] ?? 'picker'
+		}));
+		const processingFileIds = chatFiles
+			.filter((file) => file.ingestion_status !== 'ready' && file.ingestion_status !== 'failed')
+			.map((file) => file.id);
+
+		try {
+			const res = await messagesApi.sendMessageStream(
+				chat.id,
+				{
+					content: composerText,
+					model: currentModelId ?? undefined,
+					attached_skills: attachedSkillsPayload.length > 0 ? attachedSkillsPayload : undefined,
+					skill_inputs: resolvedInputs.skillInputs,
+					// Issue #207 finding 4 — only send set_sticky on a real toggle
+					// change; otherwise leave the chat's sticky set unchanged.
+					set_sticky: stickyDirty ? stickyEnabled : undefined,
+					// Chat-scoped attached files — the backend injects each ready
+					// file's canonical text as a system block (chats.py). Ownership
+					// is validated server-side; files with no text are skipped.
+					// selectFileIdsForSend drops 'failed' files and caps at 16.
+					file_ids: selectFileIdsForSend(chatFiles),
+					stream: true
+				},
+				streamAbort.signal
+			);
+			composerText = '';
+			// The toggle change has now been applied server-side for this turn.
+			stickyDirty = false;
+			// Clear the pending-enhancement marker now that the send is in
+			// flight. The enhancementOriginals map keeps the captured
+			// original keyed by content so the pill's tap-to-diff still
+			// resolves it after the user types another message.
+			pendingEnhancement = null;
+
+			if (!res.body) {
+				throw new Error('Empty stream body');
+			}
+
+			await consumeIntoMessage(res.body, draftAssistantId, processingFileIds);
+		} catch (e: unknown) {
+			streamingMessageId = null;
+			console.error('lq-ai: stream failed', e);
+			sendError = e instanceof Error ? e.message : 'Stream failed';
+		} finally {
+			streamAbort = null;
+		}
+	}
+
+	function abortStream() {
+		streamAbort?.abort();
+		streamingMessageId = null;
+	}
+
+	// PR6b — resume a paused turn after the user approves/denies the gated
+	// tool. The resume POST returns a fresh SSE stream that finalizes the SAME
+	// assistant bubble (via `consumeIntoMessage`), so a chained gate just pauses
+	// again on the same message. A 409/410 means the pending call expired or was
+	// already resolved — surface the inline re-send hint rather than a raw error.
+	async function decideToolCall(decision: 'approve' | 'deny') {
+		if (!pendingGate || pendingGate.kind !== 'confirm') return;
+		const chat = $activeChatStore;
+		if (!chat) return;
+		const { assistantId, frame } = pendingGate;
+		gateBusy = true;
+		try {
+			const res = await messagesApi.resumeToolCall(chat.id, frame.pending_call_id, decision);
+			if (!res.body) throw new Error('Empty stream body');
+			pendingGate = null;
+			await consumeIntoMessage(res.body, assistantId);
+		} catch (e: unknown) {
+			const status = (e as { status?: number })?.status;
+			if (status === 409 || status === 410) {
+				pendingGate = null;
+				sendError = 'This confirmation expired — re-send your message to continue.';
+			} else {
+				sendError = e instanceof Error ? e.message : 'Could not resume the tool call.';
+			}
+		} finally {
+			gateBusy = false;
+		}
+	}
+
+	// PR6b — connect-on-demand. Same-tab redirect to the gateway's authorize URL
+	// with a `return_url` back to this chat; PR4d lands back here with
+	// `?mcp_connected` (handled by the chats route, which then re-sends).
+	function connectMcp() {
+		if (!pendingGate || pendingGate.kind !== 'connect') return;
+		const returnUrl = window.location.href;
+		window.location.href = buildAuthorizeUrl(pendingGate.frame.authorize_url, returnUrl);
+	}
+
+	// PR6b — re-send the last user message. Exposed so the chats route can drive
+	// the "Continue" button after an OAuth return (`?mcp_connected`). Reuses the
+	// normal send path so streaming + skills + model selection stay consistent.
+	export function resendLastUserMessage(): void {
+		if (harnessChosen) {
+			sendError = RESEND_NEEDS_MODEL;
+			return;
+		}
+		const list = get(messagesStore);
+		for (let i = list.length - 1; i >= 0; i--) {
+			const candidate = list[i];
+			const isUser = candidate.kind === 'user' || candidate.role === 'user';
+			if (isUser && candidate.content) {
+				composerText = candidate.content;
+				void sendChatMessage();
+				return;
+			}
+		}
+	}
+
+	function handleAppliedSkillClicked(name: string) {
+		// Navigate to the skill detail page so the user can read the source,
+		// fork it, or try it. A richer in-chat skill-inspector side panel is
+		// a future-release item (DE-012); detail-page navigation gives users
+		// the same answer ("what is this skill?") without modal noise.
+		void goto(`/lq-ai/skills/${encodeURIComponent(name)}`);
+	}
+
+	// T6 — Enhance Prompt callbacks. The panel is mounted inline below the
+	// composer; parent owns composerText so the panel never reaches into the DOM.
+	function handleUseEnhanced(enhanced: string, _interactionId: string): void {
+		// Capture the original (current composer text) BEFORE replacing it so
+		// the diff modal can show what the user originally typed. T20 deferral
+		// A+B follow-on.
+		pendingEnhancement = { original: composerText, enhanced };
+		composerText = enhanced;
+	}
+
+	function handleEditEnhanced(enhanced: string, _interactionId: string): void {
+		// Same capture — operator may still send the (possibly hand-edited)
+		// enhanced text. We record the AI-generated baseline; if the operator
+		// edits further the diff view shows the AI's enhanced version, which
+		// is the right reference for "what did the skill change about my
+		// prompt" rather than "what did I subsequently tweak."
+		pendingEnhancement = { original: composerText, enhanced };
+		composerText = enhanced;
+	}
+
+	function handleKeepOriginal(_interactionId: string | null): void {
+		// composerText stays; clear any pending enhancement so a subsequent
+		// send doesn't falsely mark the message as enhanced.
+		pendingEnhancement = null;
+	}
+
+	function handleEnhanceDismiss(): void {
+		// Panel closed by X; no composerText change needed. Clear the
+		// pending-enhancement record so an out-of-band close doesn't
+		// leak into a subsequent send.
+		pendingEnhancement = null;
+	}
+
+	function handleComposerKeydown(e: KeyboardEvent): void {
+		// When the slash popover is open it owns Arrow/Enter/Escape via its
+		// own <svelte:window on:keydown>, which stopPropagation()s. Those
+		// keystrokes don't reach this handler. We only need to prevent the
+		// composer's own shortcuts (Cmd/Ctrl+E) from firing while the
+		// popover is open so the operator can finish skill selection
+		// without accidentally launching Enhance Prompt.
+		if (slashOpen) return;
+		// The prompt enhancer is not offered beside New harness.
+		if (harnessChosen) return;
+		if ((e.metaKey || e.ctrlKey) && e.key === 'e') {
+			e.preventDefault();
+			expansionPanel?.open();
+		}
+	}
+
+	// Wave D.2 Task 7.1 — slash-invocation popover wiring.
+	//
+	// `slashOpen` is the visibility flag for <SlashPopover>; when true the
+	// popover is mounted and steals Arrow/Enter/Escape via its own window
+	// keydown listener. `slashQuery` is the live query passed to the
+	// popover (it re-fetches on change). `slashStartIndex` is the position
+	// of the leading `/` in `composerText` — captured so onSlashSelect()
+	// can splice it out cleanly when the user picks a result.
+	//
+	// Detection runs on every input event. The plan-text snippet's
+	// detection logic lives in the module-scope `detectSlashAt` helper at
+	// the top of this file so it's unit-testable.
+	let slashOpen = false;
+	let slashQuery = '';
+	let slashStartIndex = -1;
+
+	function onComposerInput(e: Event): void {
+		const ta = e.target as HTMLTextAreaElement;
+		// `bind:value` has already updated `composerText` before this
+		// handler fires; we read from the textarea directly anyway so the
+		// caret position and value are guaranteed consistent.
+		const detection = detectSlashAt(ta.value, ta.selectionStart);
+		// A run does not use the chat's attached skills, so the slash popover stays
+		// closed beside New harness rather than attach one out of sight.
+		if (detection.open && !harnessChosen) {
+			slashOpen = true;
+			slashQuery = detection.query;
+			slashStartIndex = detection.slashIndex;
+		} else {
+			slashOpen = false;
+			slashQuery = '';
+			slashStartIndex = -1;
+		}
+	}
+
+	function onSlashSelect(item: SkillAutocompleteItem): void {
+		// Splice the "/<query>" fragment out of the composer text. The
+		// before/after slices use the captured slashStartIndex (rather
+		// than re-detecting) so a race with concurrent typing can't
+		// remove the wrong span.
+		if (slashStartIndex >= 0) {
+			const before = composerText.slice(0, slashStartIndex);
+			const after = composerText.slice(slashStartIndex + 1 + slashQuery.length);
+			composerText = (before + after).replace(/^\s*/, '');
+		}
+		// Attach via the existing handler so the SkillPicker UI + the
+		// send-handler's `attachedSkillNames` list pick up the selection.
+		// Wave D.2 Task 7.2 — pre-tag the slug with 'slash' BEFORE
+		// attachSkill() runs so its default-to-'picker' guard sees an
+		// existing entry and leaves the slash provenance intact. The
+		// send handler reads `attachmentSources` to populate
+		// `attached_skills[].source` on the outbound payload.
+		attachmentSources = { ...attachmentSources, [item.slug]: 'slash' };
+		void attachSkill(item.slug);
+		slashOpen = false;
+		slashQuery = '';
+		slashStartIndex = -1;
+	}
+
+	function onSlashDismiss(): void {
+		slashOpen = false;
+		slashQuery = '';
+		slashStartIndex = -1;
+	}
+
+	onMount(async () => {
+		await loadShell();
+		if (initialChatId) {
+			const found = get(chatsStore).find((c) => c.id === initialChatId);
+			if (found) await selectChat(found);
+		}
+		// One-shot composer prefill — read + clear so a refresh doesn't
+		// re-prefill. Used by the standalone /lq-ai/saved-prompts page when
+		// the user clicks "Use in chat" on a saved prompt. sessionStorage
+		// (not URL) keeps prompt content out of referrers + browser history.
+		if (typeof window !== 'undefined' && window.sessionStorage) {
+			const stash = window.sessionStorage.getItem('lq-ai:composer-prefill');
+			if (stash) {
+				window.sessionStorage.removeItem('lq-ai:composer-prefill');
+				composerText = stash;
+			}
+		}
+	});
+
+	$: groups = $chatsByProject;
+	$: filteredGroups = projectIdFilter
+		? groups.filter((g) => g.project?.id === projectIdFilter)
+		: activeProject
+			? groups.filter((g) => g.project?.id === activeProject?.id)
+			: groups;
+	$: activeChat = $activeChatStore;
+	$: messages = $messagesStore;
+	// Issue #207 finding 4 — re-sync the sticky toggle from the chat's persisted
+	// set whenever the active chat changes (initial load + switches). Fires only
+	// on an id change so it never clobbers an in-progress toggle within a chat;
+	// a brand-new chat has an empty set → toggle off (fail-restrictive).
+	$: if (activeChat && activeChat.id !== stickyInitChatId) {
+		stickyInitChatId = activeChat.id;
+		stickyEnabled = (activeChat.sticky_skills?.length ?? 0) > 0;
+		stickyDirty = false;
+	}
+	$: projectAttachedSkills = activeChat?.project_id
+		? ($projectsStore.find((p) => p.id === activeChat?.project_id)?.attached_skill_names ?? [])
+		: [];
+
+	// T12 — derive the project id + attached-KB ids the AttachKBModal needs.
+	// Pulled from the live projects store so an attach that happens via the
+	// matter rail (or from another chat in the same matter) reflects in the
+	// modal's "currently attached" badge without a manual refresh.
+	$: composerProjectId = activeChat?.project_id ?? null;
+	$: composerAttachedKbIds = composerProjectId
+		? ($projectsStore.find((p) => p.id === composerProjectId)?.attached_knowledge_base_ids ?? [])
+		: [];
+
+	// Wave D.1 T19 — Restore receipts drawer open-state when the active
+	// chat changes. Keyed by chat ID so each chat remembers its own drawer
+	// state across reloads + chat switches.
+	$: if (activeChat?.id) {
+		receiptsDrawerOpen = readReceiptsDrawerOpen(activeChat.id);
+	}
+
+	// ADR 0038 D1 — governed runs. Which profiles this chat can start is read when the
+	// active chat changes (and again after a run ends or a run is proposed). New
+	// harness is one of the chat's models: the choice is remembered per chat like any
+	// other, and applies only while the server offers it here. The selected documents
+	// and the request id belong to one chat's draft.
+	$: storedModelId = activeChat ? (modelByChat[activeChat.id] ?? null) : null;
+	$: harness = harnessOption(runProfiles);
+	// `mode` is the one place that decides where Send goes. `harnessChosen` is true
+	// whenever New harness is the chat's model, usable or not: the ordinary send
+	// path is then closed. `runMode` is true only while it can be used here.
+	$: mode = composerMode({
+		storedModelId,
+		read: runProfiles,
+		checked: runProfilesChecked,
+		error: runProfilesError
+	});
+	$: harnessChosen = mode.kind === 'harness';
+	$: runMode = mode.kind === 'harness' && mode.state === 'ready';
+	$: selectedRunProfile =
+		mode.kind === 'harness' && mode.state === 'ready' ? mode.option.profile : null;
+	$: harnessBlock = mode.kind === 'harness' && mode.state !== 'ready' ? mode.reason : null;
+	$: harnessRecheck = mode.kind === 'harness' && mode.state === 'unavailable' && !mode.option;
+	// Whether New harness answers by itself is what the server says of its profile. Where the read
+	// has not come back (or fails) there is no profile, so the picker says what it always said.
+	$: pickerHarness = harness
+		? {
+				id: NEW_HARNESS_ID,
+				label: NEW_HARNESS_LABEL,
+				resolves: harness.resolves,
+				disabledReason: harness.disabledReason,
+				answersDirectly: answersDirectly(harness.profile)
+			}
+		: harnessChosen
+			? {
+					id: NEW_HARNESS_ID,
+					label: NEW_HARNESS_LABEL,
+					resolves: null,
+					disabledReason: harnessBlock,
+					answersDirectly: false
+				}
+			: null;
+	// The slash popover attaches skills, which New harness does not use.
+	$: if (harnessChosen && slashOpen) onSlashDismiss();
+	$: activeRun = runProfiles?.active_run ?? null;
+	$: if (activeRun) startActiveRunPoll();
+	else stopActiveRunPoll();
+	$: proposeBlock = proposeBlocker({
+		profile: selectedRunProfile,
+		goal: composerText,
+		selectedCount: selectedDocumentIds.length
+	});
+	// Why Send waits beside New harness, or null when it can go.
+	$: sendBlock = harnessBlock ?? (runMode ? proposeBlock : null);
+	$: if ((activeChat?.id ?? null) !== runProfilesChatId) {
+		runProfilesChatId = activeChat?.id ?? null;
+		runProfiles = null;
+		runProfilesError = null;
+		runProfilesChecked = false;
+		activeRunError = null;
+		runRequest = null;
+		resetRunDraft();
+		if (runProfilesChatId) void loadRunProfiles(runProfilesChatId);
+	}
+	// A profile that reads documents the owner selects, or may: read the list when New
+	// harness is chosen, and again when the chat's attached files change.
+	$: if (
+		runMode &&
+		takesDocuments(selectedRunProfile) &&
+		documentsReadSignature(chatFiles, composerAttachedKbIds) !== runDocumentsSignature
+	) {
+		void loadRunDocuments();
+	}
+
+	// D0 — current selection for the active chat. Falls back to the
+	// picker's default (``smart`` if available, else the first row) when
+	// the user hasn't picked yet for this chat. New harness is not a provider model,
+	// so it is never this value. While New harness is the chat's model this value
+	// is not sent anywhere: `sendChatMessage` refuses.
+	$: currentModelId = activeChat
+		? ((storedModelId !== NEW_HARNESS_ID ? storedModelId : null) ??
+			defaultSelection(groupModels(availableModels))?.id ??
+			null)
+		: null;
+
+	// Wave D.1 T15 — role for the refusal-bubble override-button gate.
+	// Reads from the LQ.AI auth store (auth/store.ts); falls back to
+	// 'member' when the session has no role surfaced yet so the override
+	// path stays gated. The User.is_admin legacy flag is treated as
+	// equivalent to role === 'admin' for back-compat with sessions
+	// established before the explicit role column landed.
+	$: currentUserRole = (() => {
+		const user = $auth.user;
+		if (!user) return 'member' as const;
+		if (user.role === 'admin' || user.role === 'member' || user.role === 'viewer') {
+			return user.role;
+		}
+		return user.is_admin ? ('admin' as const) : ('member' as const);
+	})();
+
+	// AmbientFooter — derive provider/tier from the latest assistant message.
+	// Wave B will wire these from a dedicated trust endpoint.
+	$: footerProvider = (() => {
+		const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant');
+		return lastAssistant?.routed_provider ?? 'no provider';
+	})();
+	$: footerTier = (() => {
+		const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant');
+		return lastAssistant?.routed_inference_tier != null
+			? String(lastAssistant.routed_inference_tier)
+			: 'default';
+	})();
+
+	// §7.1 — long-prompt framing: at >500 word-tokens we shift the ✨ affordance
+	// from "Enhance" (expand a short prompt) to "Refine" (tighten/restructure a
+	// long prompt). Word-count is a coarse proxy for token-count; sufficient
+	// for the title/aria copy since the underlying API call is identical.
+	const ENHANCE_REFINE_TOKEN_THRESHOLD = 500;
+	$: composerWordCount = composerText.trim() ? composerText.trim().split(/\s+/).length : 0;
+	$: enhanceIsRefine = composerWordCount > ENHANCE_REFINE_TOKEN_THRESHOLD;
+	$: enhanceButtonTitle = enhanceIsRefine
+		? 'Refine prompt with AI (Cmd/Ctrl+E)'
+		: 'Enhance with AI (Cmd/Ctrl+E)';
+	$: enhanceButtonAriaLabel = enhanceIsRefine ? 'Refine prompt' : 'Enhance prompt';
+</script>
+
+<div
+	class="flex flex-1 h-full min-h-0 overflow-hidden"
+	class:compact-matter={!!projectIdFilter}
+	data-testid="lq-ai-chat-shell"
+>
+	<CompactPanel id="matter-chats" title="Chats" enabled={!!projectIdFilter}>
+		<ChatSidebar
+			groups={filteredGroups}
+			activeChatId={activeChat?.id ?? null}
+			activeProjectId={activeProject?.id ?? null}
+			{archivedToggle}
+			hideProjectFilter={!!projectIdFilter}
+			onSelectChat={selectChat}
+			onNewChat={createNewChat}
+			onSelectProject={selectProject}
+			onToggleArchived={toggleArchived}
+		/>
+	</CompactPanel>
+
+	<section class="chat-conversation flex-1 flex flex-col overflow-hidden">
+		<div
+			class="px-4 py-2 border-b border-gray-200 dark:border-gray-800 flex items-center justify-between"
+			data-testid="lq-ai-chat-header"
+		>
+			{#if activeChat}
+				<div>
+					<LqTitle order={5}>
+						{activeChat.title || 'Untitled chat'}
+					</LqTitle>
+					{#if activeChat.project_id}
+						<p class="text-xs text-gray-500">
+							In project: {$projectsStore.find((p) => p.id === activeChat.project_id)?.name ??
+								activeChat.project_id}
+						</p>
+					{/if}
+				</div>
+				<div class="flex items-center gap-2">
+					{#if messages[messages.length - 1]?.role === 'assistant' && messages[messages.length - 1]?.routed_inference_tier}
+						<TierBadge
+							tier={messages[messages.length - 1].routed_inference_tier ?? null}
+							provider={messages[messages.length - 1].routed_provider ?? null}
+						/>
+					{/if}
+				</div>
+			{:else}
+				<LqText size="sm" tone="secondary">Pick or create a chat to start.</LqText>
+			{/if}
+		</div>
+
+		<MessageList
+			{messages}
+			newHarness={harnessChosen}
+			{streamingMessageId}
+			onAppliedSkillClicked={handleAppliedSkillClicked}
+			{currentUserRole}
+			onRefusalRerun={handleRefusalRerun}
+			onRefusalOverrideRequested={handleRefusalOverrideRequested}
+			onRefusalExplainerRequested={handleRefusalExplainerRequested}
+			{enhancementOriginals}
+			{pendingGate}
+			{gateBusy}
+			onGateApprove={() => decideToolCall('approve')}
+			onGateDeny={() => decideToolCall('deny')}
+			onGateConnect={connectMcp}
+			onRunSettled={handleRunSettled}
+			onRunUpdate={handleRunUpdate}
+		/>
+
+		{#if activeChat}
+			<div
+				class="border-t border-gray-200 dark:border-gray-800 p-3 space-y-2"
+				class:lq-composer-fit={selectedRunProfile !== null}
+				data-testid="lq-ai-composer"
+			>
+				<CompactPanel
+					id="matter-chat-options"
+					title="Chat options"
+					enabled={!!projectIdFilter}
+					spaced
+				>
+					<div class="flex items-center justify-between">
+						<div class="flex items-center gap-2 flex-wrap">
+							<!-- ADR 0038 D1 — New harness is an experimental entry in this picker. -->
+							<ModelPicker
+								models={availableModels}
+								selectedId={harnessChosen ? NEW_HARNESS_ID : currentModelId}
+								harness={pickerHarness}
+								onSelect={selectModel}
+							/>
+							{#if runProfilesError && !harnessChosen}
+								<span class="text-xs lq-run-hint" data-testid="lq-ai-run-profiles-error">
+									New harness could not be checked: {runProfilesError}
+								</span>
+							{/if}
+						</div>
+						{#if !harnessChosen}
+							<!-- Issue #207 finding 4 — opt-in "sticky skills" toggle. Off by
+					     default; when on, the skills applied here stay applied to
+					     follow-up messages in this chat (resets for a new chat). -->
+							<LqGroup gap="sm">
+								<LqSwitch
+									checked={stickyEnabled}
+									onCheckedChange={(checked) => {
+										stickyEnabled = checked;
+										stickyDirty = true;
+									}}
+									aria-label="Keep skills on"
+									title="Keep the skills applied here active for follow-up messages in this chat. Off by default; a new chat starts fresh."
+									data-testid="lq-ai-sticky-toggle"
+								/>
+								<LqText size="xs" tone="secondary">Keep skills on</LqText>
+							</LqGroup>
+						{/if}
+					</div>
+
+					<!-- ADR 0038 D1 — names the run that is blocking a new one, in any chat. -->
+					{#if activeRun}
+						<RunActiveNotice
+							active={activeRun}
+							currentChatId={activeChat.id}
+							busy={closingActiveRun}
+							error={activeRunError}
+							onOpen={openActiveRunChat}
+							onClose={closeActiveRun}
+						/>
+					{/if}
+
+					{#if selectedRunProfile}
+						<!-- The one part of the composer that gives way: see `.lq-composer-fit`. -->
+						<div class="lq-harness-strip" data-testid="lq-ai-harness-strip">
+							<RunModePanel
+								profile={selectedRunProfile}
+								documentsRead={runDocuments}
+								selectedDocuments={selectedDocumentIds.length}
+							>
+								{#if takesDocuments(selectedRunProfile)}
+									<!-- One picker per draft: whether it starts open is decided when it is drawn. -->
+									{#key draftNumber}
+										<RunDocumentPicker
+											documents={runDocuments?.documents ?? []}
+											selected={selectedDocumentIds}
+											max={runDocuments?.max_documents ?? selectedRunProfile.max_documents ?? 8}
+											min={minDocuments(selectedRunProfile)}
+											inMatter={runDocuments
+												? runDocuments.project_id !== null
+												: composerProjectId !== null}
+											loading={runDocumentsLoading}
+											error={runDocumentsError}
+											onToggle={toggleRunDocument}
+											onRefresh={() => void loadRunDocuments()}
+										/>
+									{/key}
+									<!-- Not picked: a run lists every knowledge base attached to the matter. -->
+									<RunKnowledgeBases read={runDocuments} />
+								{/if}
+							</RunModePanel>
+						</div>
+					{:else if !harnessChosen}
+						<!-- Not beside New harness, usable or not: a run does not use the chat's skills. -->
+						<SkillPicker
+							availableSkills={$skillsStore}
+							selectedSkillNames={attachedSkillNames}
+							{projectAttachedSkills}
+							{skillDetails}
+							{skillInputs}
+							readyFileNames={attachedReadyNames}
+							processingFileNames={attachedProcessingNames}
+							{failedSkillNames}
+							onAttach={attachSkill}
+							onDetach={detachSkill}
+							onRetry={loadSkillDetail}
+							onUpdateInputs={updateSkillInputs}
+						/>
+					{/if}
+
+					<SavedPromptsPanel
+						onInsert={(text) => {
+							composerText = composerText.trim() ? `${composerText.trimEnd()}\n\n${text}` : text;
+						}}
+					/>
+				</CompactPanel>
+
+				{#if sendError ?? inputsError}
+					<LqAlert tone="danger" data-testid="lq-ai-send-error">
+						{sendError ?? inputsError}
+					</LqAlert>
+				{/if}
+				{#if attachmentWarning}
+					<LqAlert tone="warning" role="status" data-testid="lq-ai-attachment-warning">
+						{attachmentWarning}
+					</LqAlert>
+				{/if}
+
+				<div class="composer-row flex items-end gap-2">
+					<div class="lq-composer-wrap flex-1">
+						<textarea
+							class="lq-composer w-full text-sm resize-none"
+							rows="3"
+							placeholder={harnessChosen ? 'Ask New harness…' : 'Type a message…'}
+							bind:value={composerText}
+							data-testid="lq-ai-composer-input"
+							on:keydown={handleComposerKeydown}
+							on:input={onComposerInput}
+						></textarea>
+						{#if slashOpen && !harnessChosen}
+							<div class="lq-composer-popover" data-testid="lq-ai-slash-popover-anchor">
+								<SlashPopover
+									query={slashQuery}
+									onSelect={onSlashSelect}
+									onDismiss={onSlashDismiss}
+								/>
+							</div>
+						{/if}
+					</div>
+					{#if streamingMessageId}
+						<LqButton
+							variant="filled"
+							tone="danger"
+							size="sm"
+							type="button"
+							on:click={abortStream}
+							data-testid="lq-ai-abort-btn"
+						>
+							Stop
+						</LqButton>
+					{:else}
+						{#if composerProjectId && !harnessChosen}
+							<LqButton
+								variant="outline"
+								tone="accent"
+								size="sm"
+								type="button"
+								aria-label="Attach knowledge base"
+								title="Attach a knowledge base to this matter"
+								on:click={openAttachKbModal}
+								data-testid="lq-ai-attach-kb-btn"
+							>
+								<IconPaperclip size={14} aria-hidden="true" />
+							</LqButton>
+						{/if}
+						{#if !harnessChosen}
+							<LqButton
+								variant="outline"
+								tone="accent"
+								size="sm"
+								type="button"
+								aria-label={enhanceButtonAriaLabel}
+								title={enhanceButtonTitle}
+								on:click={() => expansionPanel?.open()}
+								disabled={!composerText.trim() || !!streamingMessageId}
+								data-testid="lq-ai-enhance-btn"
+								data-enhance-mode={enhanceIsRefine ? 'refine' : 'enhance'}
+							>
+								<IconSparkles size={14} aria-hidden="true" />
+							</LqButton>
+						{/if}
+						<LqButton
+							variant="outline"
+							tone="accent"
+							size="sm"
+							type="button"
+							aria-label="Toggle receipts drawer"
+							title="Toggle receipts"
+							on:click={() => (receiptsDrawerOpen = !receiptsDrawerOpen)}
+							data-testid="lq-ai-receipts-toggle"
+						>
+							<IconListDetails size={14} aria-hidden="true" />
+						</LqButton>
+						<!-- One Send. With New harness chosen it starts a run: one model call, and no task before a plan is approved (ADR 0038 D1). -->
+						<LqButton
+							variant="filled"
+							tone="accent"
+							size="sm"
+							type="button"
+							on:click={sendMessage}
+							disabled={harnessChosen ? sendBlock !== null || proposing : !composerText.trim()}
+							title={harnessChosen
+								? (sendBlock ?? sendWording(answersDirectly(selectedRunProfile)).sendTitle)
+								: undefined}
+							data-testid="lq-ai-send-btn"
+							data-run-mode={harnessChosen ? 'true' : undefined}
+						>
+							{proposing ? 'Sending…' : 'Send'}
+						</LqButton>
+					{/if}
+				</div>
+				{#if harnessBlock}
+					<!-- New harness is this chat's model but cannot be used now. Send waits. -->
+					<p class="text-xs lq-run-hint" role="status" data-testid="lq-ai-harness-block">
+						{harnessBlock}
+						{#if harnessRecheck && activeChat}
+							<button
+								type="button"
+								class="lq-run-recheck"
+								data-testid="lq-ai-harness-recheck"
+								on:click={() => activeChat && void loadRunProfiles(activeChat.id)}
+							>
+								Check again
+							</button>
+						{/if}
+					</p>
+				{:else if runMode && proposeBlock && composerText.trim()}
+					<p class="text-xs lq-run-hint" data-testid="lq-ai-run-propose-hint">{proposeBlock}</p>
+				{/if}
+
+				{#if !harnessChosen}
+					<EnhancePromptExpansion
+						bind:this={expansionPanel}
+						originalText={composerText}
+						chatId={activeChat?.id ?? null}
+						onUseEnhanced={handleUseEnhanced}
+						onEditEnhanced={handleEditEnhanced}
+						onKeepOriginal={handleKeepOriginal}
+						onDismiss={handleEnhanceDismiss}
+					/>
+				{/if}
+			</div>
+		{/if}
+		<AmbientFooter provider={footerProvider} tier={footerTier} />
+	</section>
+
+	{#if activeChat}
+		<CompactPanel id="matter-files" title="Attached files" enabled={!!projectIdFilter}>
+			<AttachedFilesPanel
+				{chatFiles}
+				newHarness={harnessChosen}
+				{projectFiles}
+				{uploading}
+				{attachLimitReached}
+				onUpload={uploadAttached}
+				onDetach={detachFile}
+			/>
+		</CompactPanel>
+	{/if}
+
+	{#if activeChat && receiptsDrawerOpen}
+		<ReceiptsDrawer
+			bind:open={receiptsDrawerOpen}
+			chatId={activeChat.id}
+			onClose={() => (receiptsDrawerOpen = false)}
+		/>
+	{/if}
+</div>
+
+{#if composerProjectId && attachKbModalOpen}
+	<AttachKBModal
+		bind:open={attachKbModalOpen}
+		projectId={composerProjectId}
+		attachedKbIds={composerAttachedKbIds}
+		onClose={closeAttachKbModal}
+		onAttach={handleKbsAttached}
+		onDetach={() => {}}
+	/>
+{/if}
+
+{#if overrideMessage}
+	<TierFloorOverrideModal
+		bind:open={overrideModalOpen}
+		messageId={overrideMessage.id}
+		originalTier={overrideMessage.requested_tier ?? 'unknown'}
+		enforcedTier={overrideMessage.enforced_tier ?? 'unknown'}
+		onClose={closeOverrideModal}
+		onSuccess={handleOverrideSuccess}
+	/>
+{/if}
+
+<style>
+	@import '$lib/lq-ai/styles/practice.css';
+
+	.chat-conversation,
+	.lq-composer-wrap {
+		min-width: 0;
+		min-height: 0;
+	}
+
+	@media (max-width: 1279px) {
+		.compact-matter {
+			flex-direction: column;
+			min-width: 0;
+		}
+
+		.compact-matter .chat-conversation {
+			min-height: 0;
+		}
+
+		.compact-matter .composer-row {
+			flex-wrap: wrap;
+		}
+
+		.compact-matter .lq-composer-wrap {
+			flex: 1 0 100%;
+		}
+	}
+
+	.lq-composer-wrap {
+		/* Anchor for the slash-invocation popover (Wave D.2 Task 7.1).
+		   The popover renders absolutely-positioned just above the
+		   textarea so the user's eye-line stays on what they typed. */
+		position: relative;
+	}
+
+	.lq-composer-popover {
+		position: absolute;
+		bottom: calc(100% + 4px);
+		left: 0;
+		z-index: 50;
+	}
+
+	/* ADR 0038 D1 — beside New harness the composer is never taller than the room the
+	   chat column has. The column does not scroll, so anything taller would push the
+	   message box and Send out of the window with no way to reach them. The strip is
+	   the one part that gives way: what is opened in it scrolls inside it. The
+	   composer itself keeps `overflow: visible`, because the model list and the slash
+	   popover open out of it. */
+	.lq-composer-fit {
+		display: flex;
+		flex-direction: column;
+		min-height: 0;
+	}
+	.lq-composer-fit > :global(*) {
+		flex-shrink: 0;
+	}
+	.lq-composer-fit .lq-harness-strip {
+		flex-shrink: 1;
+		min-height: 6rem;
+		overflow-y: auto;
+		overscroll-behavior: contain;
+	}
+
+	/* ADR 0038 D1 — why Send waits beside New harness, shown under the composer. */
+	.lq-run-hint {
+		color: var(--lq-text-secondary);
+	}
+	.lq-run-recheck {
+		margin-left: 0.25rem;
+		color: var(--lq-accent);
+		text-decoration: underline;
+		background: none;
+		border: 0;
+		padding: 0;
+		cursor: pointer;
+	}
+
+	.lq-composer {
+		background: var(--lq-canvas);
+		color: var(--lq-text);
+		border: 1.5px solid var(--lq-border);
+		border-radius: var(--lq-radius-lg);
+		padding: 12px;
+	}
+	.lq-composer:focus {
+		border-color: var(--lq-accent);
+		outline: none;
+	}
+	.lq-composer::placeholder {
+		color: var(--lq-text-tertiary);
+	}
+</style>

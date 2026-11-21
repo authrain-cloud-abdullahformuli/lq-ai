@@ -1,0 +1,277 @@
+# ============================================================
+# LQ.AI — .gitignore
+# ============================================================
+# Conventions:
+#   - Keep this file at the repo root.
+#   - Do not let operator data or launch-staging content reach the repo.
+#   - Use .gitkeep files to preserve empty directories that should exist.
+# ============================================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+# Anchored to root so it ignores Python venv `lib/` directories at the
+# project root (and per-subsystem) without reaching into `web/src/lib/`,
+# which is OpenWebUI's tracked Svelte library.
+/lib/
+/api/lib/
+/gateway/lib/
+/scripts/lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing & coverage
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+htmlcov/
+# mutmut (DE-229) working copy — created by `mutmut run` in api/ and gateway/
+mutants/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# Linting
+.ruff_cache/
+.pylintrc
+
+# Jupyter
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# ---------- Node / JavaScript ----------
+node_modules/
+.npm/
+.yarn/
+.pnp/
+.pnp.js
+yarn-debug.log*
+yarn-error.log*
+npm-debug.log*
+package-lock.json.bak
+
+# Build outputs
+.next/
+.nuxt/
+.svelte-kit/
+.parcel-cache/
+.turbo/
+out/
+
+# ---------- Environment & secrets ----------
+# .env is the operator's local config; never commit
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.test
+
+# Operator's actual gateway.yaml (the .example version is committed)
+gateway.yaml
+config.yaml
+
+# Local development overrides
+docker-compose.override.yml
+gateway.local.yaml
+config.local.yaml
+
+# Certificates and keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+.secrets/
+
+# ---------- IDEs ----------
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.iml
+*.ipr
+*.iws
+.history/
+
+# ---------- OS ----------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# macOS Finder duplicate files. On iCloud-synced trees, Finder
+# occasionally creates phantom duplicates named "foo 2.py", "foo 3.ts",
+# "foo 4.svelte", etc., when it perceives a conflict. These break
+# Alembic head resolution, Python imports, Vite imports, and docker
+# builds (see api/.dockerignore + gateway/.dockerignore + web/.dockerignore
+# for the build-time guard). This pattern keeps them out of git.
+* [0-9].*
+* [0-9][0-9].*
+
+# ---------- Operator-private content ----------
+# Test corpus is the operator's anonymized real documents; per
+# docs/acceptance-testing-framework.md, this stays local and
+# is documented in test plans, not committed.
+test-corpus/
+test-results/
+
+# Operator-generated runtime data (runtime artifacts only — do NOT
+# ignore application-bundled data such as ``api/app/data/`` which
+# ships templates and fixtures inside the api package).
+data/
+!api/app/data/
+logs/
+uploads/
+postgres-data/
+redis-data/
+minio-data/
+
+# ---------- Launch-staging content ----------
+# These folder names should NEVER appear in the repo. The
+# launch-staging content (LinkedIn drafts, GitHub issue
+# bodies pasted into Issues UI) lives in a separate local
+# folder per FILE-MANIFEST.md. These ignore patterns are
+# defense-in-depth in case content gets accidentally copied.
+lq-ai-launch/
+launch-staging/
+linkedin-*.md
+issues-staging/
+
+# Internal positioning + engineering-discipline reference docs.
+# Used to inform the *style* of public docs (transparent gap
+# framing, defensive posture against commercial comparisons) but
+# never published. Treat as operator-private.
+docs/PRD_Addendum_Engineering_Discipline.md
+docs/LaunchPositioning_TwoAxesOfTrust.md
+
+# Internal planning artifacts (audit reports, foundation-readiness
+# analyses, backlog inventories produced by `.planning/` workflows).
+# These are working notes by definition — never published.
+.planning/
+
+# ---------- Temporary / scratch ----------
+tmp/
+temp/
+scratch/
+*.tmp
+*.bak
+*.orig
+*.draft
+
+# ---------- Generated artifacts ----------
+docs/_build/
+docs/build/
+*.generated.md
+# Documentation site (site/, ADR 0028): dependencies, build output and the
+# content collection that `npm run sync` regenerates from docs/site/.
+site/node_modules/
+site/dist/
+site/.astro/
+site/src/content/docs/
+site/src/content/explore/
+site/src/generated/
+site/public/_repo/
+site/public/_diagrams/
+site/.diagram-cache/
+site/.sync-manifest.json
+# Design-QA screenshots (site/scripts/screenshot.mjs). A local look, not an artifact.
+site/.screens/
+
+# ---------- Tool-specific ----------
+# Pre-commit
+.pre-commit-cache/
+
+# direnv
+.envrc
+.direnv/
+
+# Cython debug
+cython_debug/
+
+# Local TLS / dev certs
+*.local.pem
+*.local.key
+localhost.pem
+localhost.key
+
+# Backup files from editors and merge tools
+*.swp
+*.swo
+*.swn
+*.un~
+.*~
+*.orig
+*.rej
+
+# ---------- Cleanup pip / package manager artifacts ----------
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Brainstorming mockups (visual companion)
+.superpowers/
+
+# Phase E Makefile sbom output (throwaway local-convenience artifacts)
+artifacts/
+
+# Launch announcement drafts (private — used in posts, not in the repo)
+ANNOUNCEMENT.md
+LAUNCH-POST.md
+
+# stack smoke failure diagnostics (scripts/stack-smoke.sh)
+stack-smoke-logs/
+
+# skill golden harness per-fixture reports (tests/golden/, DE-231)
+golden-report/
+
+# prompt-injection harness per-attack + summary reports (tests/injection/, DE-239)
+injection-report/

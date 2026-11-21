@@ -1,0 +1,171 @@
+"""HTTP API routers for the backend.
+
+Each module under `app.api` corresponds to one tag-group in
+`docs/api/backend-openapi.yaml`. In Task A4 (this scaffold), every endpoint
+is registered but returns HTTP 501 with a structured "not implemented" body
+that names the M1 task implementing it. Subsequent tasks (B1, B5, C3, C4,
+C7, etc.) replace each 501 with a real handler.
+
+Auth gating (Task B2): the `auth` and `users` routers are mounted without
+a router-level auth dependency — they need different per-endpoint policies
+(login is unauthenticated, /users/me must be reachable while
+must_change_password is true so the client can read the flag, etc.). Every
+other router is mounted under the `ActiveUser` dependency, which enforces:
+
+1. A valid bearer token (401 without it).
+2. `must_change_password = false` (403 with `password_change_required`).
+
+This means future C-/D-phase implementations of these endpoints inherit
+the auth+gate without any change at the handler level — they just need a
+real handler body to replace the 501.
+"""
+
+from fastapi import APIRouter, Depends
+
+from app.api import (
+    admin,
+    admin_intake_bridges,
+    admin_matters,
+    admin_mcp,
+    auth,
+    autonomous,
+    bootstrap,
+    chat_receipts,
+    chat_runs,
+    chats,
+    community_skills,
+    enhance_prompt,
+    files,
+    inference,
+    inference_override,
+    integrations_slack,
+    integrations_teams,
+    internal,
+    knowledge_bases,
+    matter_members,
+    mcp_oauth,
+    models,
+    orchestration,
+    organization_profile,
+    playbooks as playbooks_api,
+    projects,
+    research,
+    saved_prompts,
+    skill_workspaces,
+    skills,
+    tabular,
+    teams,
+    user_skills,
+    users,
+    word_addin,
+)
+from app.api.dependencies import get_active_user
+
+api_router = APIRouter(prefix="/api/v1")
+
+# Routers with mixed per-endpoint policies — see each module for details.
+api_router.include_router(auth.router)
+api_router.include_router(users.router)
+
+# Unauthenticated probe used by the login UI to surface fresh-install hints
+# (M3-0.1 / DE-283). Mounted without `_active` because the login screen
+# consults it before the operator has credentials.
+api_router.include_router(bootstrap.router)
+
+# Service-to-service router (gateway → backend). Authenticated by the
+# shared X-LQ-AI-Gateway-Key header per ADR 0006, NOT by the user-token
+# gate. Mounted without `_active` deliberately: the gateway has no user.
+api_router.include_router(internal.router)
+
+# M3-D1: slack-bridge → api persistence surface. Authenticated by the
+# shared LQ_AI_BRIDGE_TOKEN bearer header at the handler level, NOT by
+# the user-token gate. Mounted without `_active` deliberately: the
+# bridge is a service-to-service caller with no user context.
+api_router.include_router(integrations_slack.router)
+
+# M3-D3: teams-bridge → api persistence surface. Same auth posture as
+# the slack-bridge endpoint (shared LQ_AI_BRIDGE_TOKEN bearer); no
+# per-tenant secrets persisted because Teams uses app-level bot
+# credentials (one MICROSOFT_APP_ID per deployment).
+api_router.include_router(integrations_teams.router)
+
+# M3-B8 — Word add-in version handshake. Unauthenticated: the task pane
+# calls this on mount BEFORE the user has signed in, so an out-of-date
+# add-in can surface an "Update needed" overlay before the OAuth dialog
+# even tries to load.
+api_router.include_router(word_addin.public_router)
+
+# Routers that uniformly require an authenticated, must_change_password=false
+# user. Applying this at the router level means every current stub and every
+# future real handler in these modules inherits the gate automatically.
+_active = [Depends(get_active_user)]
+api_router.include_router(projects.router, dependencies=_active)
+# Matter roster — mounted on the same /projects prefix so membership reads
+# as part of the matter surface rather than a separate resource.
+api_router.include_router(matter_members.router, dependencies=_active)
+api_router.include_router(admin_matters.router, dependencies=_active)
+api_router.include_router(chats.router, dependencies=_active)
+api_router.include_router(chat_receipts.router, dependencies=_active)
+api_router.include_router(skills.router, dependencies=_active)
+api_router.include_router(skill_workspaces.router, dependencies=_active)
+api_router.include_router(models.router, dependencies=_active)
+api_router.include_router(files.router, dependencies=_active)
+api_router.include_router(knowledge_bases.router, dependencies=_active)
+api_router.include_router(organization_profile.router, dependencies=_active)
+api_router.include_router(saved_prompts.router, dependencies=_active)
+api_router.include_router(user_skills.router, dependencies=_active)
+api_router.include_router(teams.user_router, dependencies=_active)
+api_router.include_router(teams.admin_router, dependencies=_active)
+api_router.include_router(enhance_prompt.router, dependencies=_active)
+api_router.include_router(inference.router, dependencies=_active)
+api_router.include_router(inference_override.router, dependencies=_active)
+api_router.include_router(admin.router, dependencies=_active)
+# M3-D4: admin intake-bridges surface (list + soft-delete for Slack
+# workspaces + Teams tenants). Admin-gated at handler level via the
+# AdminUser dependency; mounted under the `_active` group so the
+# bearer-token + must-change-password gates fire first.
+api_router.include_router(admin_intake_bridges.router, dependencies=_active)
+# 3.8 / DE-263: community skill installer (catalog from the local
+# submodule per ADR 0041). Admin-gated at handler level via AdminUser;
+# mounted under `_active` so the bearer + must-change-password gates
+# fire first.
+api_router.include_router(community_skills.router, dependencies=_active)
+# M4-A4-i: Autonomous sessions read/halt API — per-user isolated, bearer-auth.
+api_router.include_router(autonomous.router, dependencies=_active)
+api_router.include_router(orchestration.router, dependencies=_active)
+# ADR 0038: governed runs hosted in a chat thread (intake + availability reads),
+# and the operator's read of the run profile registry.
+api_router.include_router(chat_runs.router, dependencies=_active)
+api_router.include_router(orchestration.admin_router, dependencies=_active)
+# M3-A2: Playbook executor — two endpoints under different prefixes
+# (``/playbooks/{id}/execute`` and ``/playbook-executions/{id}``) so
+# they live alongside the M3-A4 list/CRUD endpoints in the same module.
+api_router.include_router(playbooks_api.router, dependencies=_active)
+# M3-C2: Tabular / Multi-Document Review surface (PRD §3.14). Six
+# endpoints under /tabular/ — preview-cost / execute / list / detail /
+# delete / cancel. The shared playbook ARQ worker
+# (:mod:`app.workers.tabular_worker`) consumes from the same queue
+# as Easy Playbook per Phase C prep doc Decision C-3.
+api_router.include_router(tabular.router, dependencies=_active)
+# M3-B1: Word add-in admin surface (manifest generation). Mounted with
+# the AdminUser dep at handler level. M3-B8's version-handshake route
+# lives in the same module but on a separate ``public_router`` mounted
+# above without the ``_active`` gate.
+api_router.include_router(word_addin.admin_router, dependencies=_active)
+# WS3b — case-law research surface (verify-citations, search, clusters,
+# opinions, find-in-case). All five endpoints require an authenticated,
+# password-changed user; auth enforced via the _active dependency group.
+api_router.include_router(research.router, dependencies=_active)
+# WS2/PR4b — MCP registry admin surface (list, refresh, enable/disable).
+# Admin-gated at handler level via the AdminUser dependency; mounted
+# under _active so the bearer-token + must-change-password gates fire first.
+api_router.include_router(admin_mcp.router, dependencies=_active)
+# PR4c — per-user MCP OAuth surface (authorize, callback, status, disconnect).
+# Registered WITHOUT _active because the callback endpoint must remain public
+# (the browser redirect from the AS cannot carry a bearer token). Each
+# authenticated handler (authorize, status, disconnect) takes ActiveUser
+# explicitly. The callback endpoint takes no user dependency — the user is
+# recovered from the single-use mcp_oauth_state row inside exchange_code.
+api_router.include_router(mcp_oauth.router)
+
+__all__ = ["api_router"]

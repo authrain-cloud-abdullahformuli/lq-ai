@@ -1,0 +1,700 @@
+# ============================================================
+# LQ.AI — Inference Gateway Configuration
+# ============================================================
+# This file configures the Inference Gateway: which providers
+# are available, which models map to which provider, what tier
+# each routing decision lands at, anonymization, rate limits,
+# and operational settings.
+#
+# Save your operator-specific copy as `gateway.yaml` (this
+# `.example` file is committed to the repo as reference).
+#
+# References:
+#   PRD §4 — Inference Gateway specification
+#   PRD §1.5.2 — Inference Choice Spectrum (the 5-tier model)
+#   PRD §4.7 — Anonymization Layer (M2)
+#
+# Configuration changes take effect on gateway restart for
+# top-level changes; tier-policy changes via /admin/inference-tiers
+# take effect immediately and are audited.
+# ============================================================
+
+# Gateway operational settings
+server:
+  host: 0.0.0.0
+  port: 8001
+  log_level: info  # debug | info | warn | error
+
+# How the gateway authenticates incoming requests
+# (the backend service identifies itself with this key)
+gateway_auth:
+  enabled: true
+  api_key_env: LQ_AI_GATEWAY_KEY
+  # Backend services must include X-LQ-AI-Gateway-Key header
+  #
+  # The gateway uses the SAME shared secret in the reverse direction
+  # when fetching skill content from the backend's
+  # `/api/v1/internal/skills/{name}` endpoint during prompt assembly
+  # (C2 / ADR 0006). The api/ side also reads LQ_AI_GATEWAY_KEY and
+  # constant-time compares the X-LQ-AI-Gateway-Key header on inbound
+  # internal-route calls.
+  #
+  # Skill-fetch base URL: LQ_AI_API_URL (env var; defaults to
+  # http://api:8000 in the Compose stack). Skill-fetch cache TTL:
+  # LQ_AI_SKILL_CACHE_TTL_SECONDS (env var; default 60s).
+
+# ============================================================
+# PROVIDERS — what LLM endpoints the gateway can reach
+# ============================================================
+# Each provider entry includes:
+#   name      — operator-chosen identifier (referenced from model_aliases)
+#   type      — provider family (anthropic, openai, vertex, etc.)
+#   base_url  — endpoint URL
+#   api_key_env       — environment variable name to look up (NOT the key)
+#   api_key_encrypted — Fernet-wrapped ciphertext (ADR 0011, alternative)
+#   tier      — default Inference Tier for this provider/account
+#   models    — which models the provider exposes
+#
+# Per ADR 0011 each provider entry uses EITHER `api_key_env` OR
+# `api_key_encrypted`, not both. The encrypted path lets operators
+# commit `gateway.yaml` to a private repo / backup snapshots without
+# leaking the plaintext key:
+#   1. `python -m app.cli generate-master-key` → store as
+#      LQ_AI_GATEWAY_MASTER_KEY in your secrets vault.
+#   2. Export the master key in the gateway's environment.
+#   3. `python -m app.cli encrypt-key --provider <name>` → paste the
+#      output as `api_key_encrypted: gAAAAAB...`.
+# The gateway decrypts in-memory at adapter build time; plaintext keys
+# never touch disk after step 3.
+#
+# THIRD PATH — runtime admin provider-keys API (post-v0.4.0, #128).
+# Admins can manage keys at runtime via `/admin/v1/provider-keys`
+# (proxied by the backend at `/api/v1/admin/provider-keys`) instead of
+# hand-editing this file: POST writes the `api_key_encrypted` field into
+# this `gateway.yaml` automatically (same Fernet wrapping as step 3) AND
+# hot-applies the key to the live adapter in-place — no restart, no
+# SIGHUP. PATCH rotates, DELETE revokes. This path requires
+# LQ_AI_GATEWAY_MASTER_KEY to be set (the API returns 400
+# failed_precondition otherwise). Keys provided via `api_key_env`
+# continue to work and report their source as `env`; runtime-managed
+# keys report `runtime`. The encrypt-CLI path above remains valid for
+# operators who prefer to commit ciphertext by hand.
+#
+# IMPORTANT: tier values reflect the operator's specific
+# agreement with the provider. A standard commercial Anthropic
+# API account is Tier 4. An Anthropic enterprise account with
+# zero-data-retention is Tier 3. Local Ollama is Tier 1. The
+# operator MUST verify their tier assignments match their
+# actual provider relationships.
+
+providers:
+  # --- Cloud providers ---
+
+  - name: anthropic-prod
+    type: anthropic
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    tier: 4  # Standard commercial Anthropic API
+    # tier: 3  # If operator has enterprise ZDR agreement
+    # Optional: default max_tokens injected when the caller omits it
+    # (Anthropic requires the field). Falls back to 16384 when unset — a
+    # ceiling, not a spend; an explicit request max_tokens always wins.
+    # Operator escape hatch (ADR 0027 D2), not the tuning axis.
+    # default_max_tokens: 8192
+    models:
+      - claude-opus-4-7
+      - claude-sonnet-4-6
+      - claude-haiku-4-5
+
+  - name: openai-prod
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    tier: 4  # Standard commercial OpenAI API
+    # tier: 3  # If operator has zero-data-retention contract
+    # GPT-5 / o-series reasoning models REJECT max_tokens (hard 400) and
+    # require max_completion_tokens. Leave false for gpt-4o / older models
+    # or OpenAI-compatible local servers that only accept max_tokens.
+    use_max_completion_tokens: true
+    models:
+      - gpt-5
+      - gpt-5-mini
+      - gpt-5-nano
+
+  - name: vertex-anthropic
+    type: vertex
+    base_url: https://us-central1-aiplatform.googleapis.com
+    api_key_env: GOOGLE_APPLICATION_CREDENTIALS  # path to service-account JSON
+    # `:-` default lets the gateway load even when GCP_PROJECT_ID is unset
+    # (fresh `docker compose up` works without GCP credentials). Operators
+    # routing to Vertex set GCP_PROJECT_ID in their .env.
+    project_id: ${GCP_PROJECT_ID:-disabled}
+    region: us-central1
+    tier: 3  # Vertex routes through customer's GCP project; ZDR by GCP terms
+    models:
+      - claude-opus-4-7@anthropic
+      - claude-sonnet-4-6@anthropic
+
+  - name: bedrock
+    type: bedrock
+    # One protocol per entry: messages, chat_completions, or responses.
+    # Additional entries may share this key with different explicit protocols.
+    # No SigV4/STS credentials are consumed by the compatible-API adapter.
+    bedrock_protocol: messages
+    bedrock_endpoint: runtime  # mantle is an explicit opt-in for models requiring it
+    base_url: https://bedrock-runtime.${AWS_REGION:-us-east-1}.amazonaws.com/anthropic
+    api_key_env: AWS_BEARER_TOKEN_BEDROCK
+    tier: 3  # Operator must verify terms, retention/logging and regional requirements.
+    models:
+      # Select an entitled model/profile for the configured region; this is not
+      # a claim that the account has access. See docs/bedrock-verification.md.
+      - us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+  - name: azure-openai
+    type: azure_openai
+    # M2-E1 (DE-267): Azure OpenAI adapter. Mirrors the OpenAI wire shape
+    # with a deployment-scoped URL and `api-key` auth.
+    #
+    # `:-` default lets the gateway load without an Azure resource configured;
+    # operators routing to Azure set AZURE_OPENAI_RESOURCE in their .env.
+    base_url: https://${AZURE_OPENAI_RESOURCE:-disabled}.openai.azure.com
+    api_key_env: AZURE_OPENAI_API_KEY
+    # api_version pins which Azure-side features are available (Azure rolls
+    # capabilities in/out per version). Bump to a newer GA version
+    # ('2024-10-21' or later) for current chat-completion features.
+    api_version: '2024-08-01-preview'
+    tier: 3  # Azure OpenAI under enterprise agreement (ZDR + BAA)
+    # GPT-5 / o-series deployments REJECT max_tokens (hard 400) and require
+    # max_completion_tokens. Azure deployment-ids are operator-named, so this
+    # is set per-provider rather than inferred from the model name.
+    use_max_completion_tokens: true
+    # CRITICAL: each entry is the Azure DEPLOYMENT-ID (operator-named in
+    # the Azure portal), NOT the underlying model name. Many operators
+    # run multiple deployments of the same model with different SKUs;
+    # the gateway routes by deployment-id via the alias map below.
+    models:
+      - gpt-5-prod             # e.g., a deployment of gpt-5
+      - gpt-5-mini-prod        # e.g., a deployment of gpt-5-mini
+
+  # --- Local providers (Tier 1) ---
+
+  - name: ollama-local
+    type: ollama
+    # Default reaches the in-Compose ollama service (pulled in by
+    # `docker compose --profile local up`). Operators running Ollama
+    # on the host instead set OLLAMA_BASE_URL=http://host.docker.internal:11434
+    # in their .env. Per PRD §1.5.1 / §6.1 Ollama is the Mode-2 (fully
+    # local, air-gap-capable) backbone — Tier 1 by every authoritative
+    # reference (PRD §1.5.2: "Local-only inference (air-gap-capable)").
+    # See B6 partial in M1-PROGRESS for the adapter that wires this up.
+    #
+    # NOTE (LLM egress policy, GW-04): a plaintext ``http://`` base_url is
+    # accepted only for loopback/private/local hosts (localhost, RFC-1918
+    # ranges, host.docker.internal, in-Compose service names). A base_url
+    # that violates the policy is FATAL AT STARTUP — the gateway refuses to
+    # boot rather than silently skip the provider, because a skipped local
+    # primary would let the router fall through to a cloud fallback the
+    # operator did not choose. If startup fails naming this provider, fix
+    # the base_url (most often a mistyped OLLAMA_BASE_URL).
+    base_url: ${OLLAMA_BASE_URL:-http://ollama:11434}
+    api_key_env: ''  # Ollama doesn't require an API key
+    tier: 1  # Fully local; no data leaves the deployment
+    models:
+      - qwen3.5:9b
+      - qwen3.5:4b-nvfp4
+      - gemma4:e4b
+    enabled: ${LOCAL_INFERENCE_ENABLED:-true}
+
+  - name: vllm-local
+    type: openai_compatible  # vLLM exposes OpenAI-compatible API
+    base_url: http://vllm:8000/v1
+    # Empty: a keyless local server. For a hosted OpenAI-compatible service,
+    # name its key variable here; if that variable is not set the provider
+    # is skipped at startup with a warning, like any other missing key.
+    api_key_env: ''
+    tier: 1
+    models:
+      - meta-llama/Meta-Llama-3.1-70B-Instruct
+    enabled: ${VLLM_ENABLED:-false}
+
+# ============================================================
+# TOOL / DATA-SOURCE PROVIDERS (ADR 0014) — third-party egress
+# ============================================================
+# A tool provider is third-party egress the gateway brokers and audits
+# (case-law APIs, MCP servers). Distinct from inference `providers:` above.
+# Every entry is SSRF/allowlist-guarded, tier-tagged, rate-limited, and
+# written to `tool_egress_log`. Uncomment and configure to enable.
+#
+# Runtime alternative: enable these from the app (Settings → Research sources)
+# or POST /api/v1/admin/tool-providers — no YAML edit or restart needed.
+#
+# tool_providers:
+#   - name: courtlistener-prod
+#     type: courtlistener          # courtlistener type is shipped (WS3a); uncomment + set COURTLISTENER_API_TOKEN to enable
+#     base_url: https://www.courtlistener.com/api/rest/v4
+#     api_key_env: COURTLISTENER_API_TOKEN   # OR api_key_encrypted (ADR 0011)
+#     egress_tier: 4               # data-egress tier (ADR 0014 D4)
+#     allowlist:
+#       hosts: [www.courtlistener.com]   # exact outbound host allowlist (SSRF)
+#     rate_limit:
+#       requests_per_minute: 60    # per-provider, enforced at the adapter
+#     anonymize_outbound: true     # default; generic CourtListener transform remains deferred
+#
+#   - name: govinfo-prod
+#     type: govinfo                # shipped in WS-E PR1a; uncomment + set GOVINFO_API_KEY to enable
+#     base_url: https://api.govinfo.gov
+#     api_key_env: GOVINFO_API_KEY          # api.data.gov key — free tier sufficient for legal research
+#     egress_tier: 4               # public statutory/regulatory data (ADR 0014 D4)
+#     allowlist:
+#       hosts: [api.govinfo.gov]   # exact outbound host allowlist (SSRF)
+#     rate_limit:
+#       requests_per_minute: 60    # api.data.gov default is 1200/min; 60 is conservative
+#     anonymize_outbound: false    # opt-out; set true for checked authority-query anonymization
+#     # GovInfo data is free (no per-call cost). Fields below are optional DE-344 extensions
+#     # for future cost-tracking dashboards; omit or set to 0 for free sources:
+#     # cost_per_call: 0.0
+#     # cost_per_unit: 0.0
+#
+#   - name: edgar-prod
+#     type: edgar                  # shipped in WS-E PR2a; uncomment to enable
+#     base_url: https://efts.sec.gov          # full-text search host; get_authority reaches www.sec.gov
+#     user_agent: "YourOrg legal-ops@yourorg.example"   # SEC fair-access policy — REQUIRED, no API key
+#     egress_tier: 4               # public filing data (ADR 0014 D4)
+#     allowlist:
+#       hosts: [efts.sec.gov, www.sec.gov]
+#     rate_limit:
+#       requests_per_minute: 300   # SEC allows ~10 req/s
+#     anonymize_outbound: false    # opt-out; set true for checked authority-query anonymization
+#     # (no api_key_env — EDGAR needs only a User-Agent)
+#     # (no cost_per_call — free source; R4 stays a no-op)
+#
+#   - name: eurlex-prod
+#     type: eurlex                 # shipped in WS-E PR2b; uncomment to enable
+#     base_url: https://publications.europa.eu    # EU Cellar (content-negotiation by CELEX)
+#     user_agent: "YourOrg legal-ops@yourorg.example"   # descriptive UA — REQUIRED, no API key
+#     egress_tier: 4               # public EU legal text (ADR 0014 D4)
+#     allowlist:
+#       hosts: [publications.europa.eu]
+#     rate_limit:
+#       requests_per_minute: 60
+#     anonymize_outbound: false    # opt-out; set true for checked authority-query anonymization
+#     # (no api_key_env — EUR-Lex Cellar needs only a User-Agent)
+#     # (no cost_per_call — free source; R4 stays a no-op)
+
+# ============================================================
+# MODEL ALIASES — friendly names → specific provider/model
+# ============================================================
+# Skills and the backend reference models by alias rather than
+# by specific provider/model. This decouples skill authoring
+# from provider configuration; the operator can swap out the
+# provider behind 'smart' without changing any skill.
+#
+# RAW PASSTHROUGH (D0): callers may also bypass the alias map by
+# sending ``model: "<provider_name>/<native_model>"`` directly,
+# e.g., ``anthropic-prod/claude-haiku-4-5`` or
+# ``ollama-local/qwen2.5:7b``. The provider name MUST match an
+# entry in ``providers:`` above; the model component is the
+# provider-native name (no further translation). Tier is derived
+# the same way as for aliases — overrides → defaults →
+# provider.tier. Used by the LQ.AI shell's model picker so users
+# can target a specific model without authoring a new alias.
+
+model_aliases:
+  # User-facing aliases referenced by skills and the chat UI
+
+  smart:
+    primary:
+      provider: anthropic-prod
+      model: claude-opus-4-7
+    fallback:
+      - {provider: vertex-anthropic, model: claude-opus-4-7@anthropic}
+      - {provider: openai-prod, model: gpt-5}
+
+  fast:
+    primary:
+      provider: anthropic-prod
+      model: claude-sonnet-4-6
+    fallback:
+      - {provider: openai-prod, model: gpt-5-mini}
+
+  budget:
+    primary:
+      provider: anthropic-prod
+      model: claude-haiku-4-5
+    fallback:
+      - {provider: openai-prod, model: gpt-5-nano}
+
+  local:
+    primary:
+      provider: ollama-local
+      model: qwen3.5:9b
+    fallback: []  # No fallback for local — Tier 1 must stay Tier 1
+
+  # Mode-2 friendly aliases (B6 partial). Skills and the chat UI ask
+  # for these by name when the operator wants the response to come from
+  # the air-gapped local model. Both stay Tier 1 — the fallback list is
+  # empty so a missing local provider surfaces as a clean 503 rather
+  # than silently degrading to a cloud Tier 4 path.
+  #
+  # Default model choices reflect what a current Ollama install can
+  # actually serve well in 2026. Qwen3.5 is the family we ship behind
+  # the Mode-2 aliases (PRD §6.1); operators free to repoint at any
+  # ollama-served model by editing this section. The "fast" / "thinking"
+  # split mirrors the cloud split — 4b for low-latency, 9b when the
+  # quality lift is worth the wall-clock.
+  local-fast:
+    primary:
+      provider: ollama-local
+      model: qwen3.5:4b-nvfp4
+    fallback: []
+
+  local-thinking:
+    primary:
+      provider: ollama-local
+      model: qwen3.5:9b
+    fallback: []
+
+  # The 'embedding' alias is the alias the backend's KB layer (C6)
+  # asks the gateway to dispatch. Per ADR 0008 the default points at
+  # OpenAI's text-embedding-3-small (1536-dim — matches the
+  # document_chunks.embedding column type). Operators who don't run
+  # OpenAI can repoint at a different provider when its adapter
+  # lands (e.g., a future Voyage adapter) without changing any
+  # application code; the dimension constraint must match the column
+  # type or the operator runs an ALTER migration to swap the column.
+  embedding:
+    primary:
+      provider: openai-prod
+      model: text-embedding-3-small
+    fallback: []
+
+# ============================================================
+# INFERENCE TIERS — derivation overrides (PRD §1.5.2 / §3.13)
+# ============================================================
+# Tier derivation runs for every routed request and stamps
+# ``routed_inference_tier`` on the response (header + body
+# field) and into ``inference_routing_log``. Resolution order
+# (first match wins):
+#
+#   1. inference_tiers.overrides["<provider_name>/<model>"]
+#   2. inference_tiers.overrides["<provider_name>"]
+#   3. inference_tiers.defaults["<provider_type>"]
+#   4. The provider entry's own ``tier:`` field (above)
+#
+# This block is OPTIONAL. With the block omitted, every routed
+# request takes its tier from the provider entry's ``tier:``
+# field — which is the simplest configuration and matches what
+# every provider in this example already declares.
+#
+# Operators with mixed posture (e.g., a single Bedrock model
+# under a ZDR addendum that should be Tier 2 instead of 3) use
+# ``overrides`` to call out the exception without restating the
+# whole provider's tier.
+
+inference_tiers:
+  defaults:
+    anthropic: 4         # standard commercial API
+    openai: 4
+    vertex: 3            # routes through customer GCP project
+    bedrock: 3           # routes through customer AWS account
+    azure_openai: 3      # routes through customer Azure tenant
+    cohere: 4
+    ollama: 1            # fully local — Mode 2 (air-gap-capable)
+    vllm: 1              # fully local
+    openai_compatible: 1 # local inference servers (vLLM, llama.cpp wrappers)
+  # overrides:
+  #   anthropic-prod/claude-opus-4-7: 3  # if operator has a ZDR addendum
+  #
+  # Tier-1 placement for the Mode-2 aliases is inherited from
+  # ``defaults.ollama: 1`` above — no override needed. The PRD §1.5.2
+  # framing for Tier 1 ("Local-only inference (air-gap-capable). No
+  # outbound network is required. Customer data, prompts, and model
+  # outputs never leave the deployment.") is what every Ollama-routed
+  # request lands at; the routing-log row carries
+  # ``routed_inference_tier=1`` and the chat UI surfaces the tier
+  # badge accordingly.
+
+# ============================================================
+# TIER POLICY — what the deployment allows
+# ============================================================
+# The operator-level policy. Skills and Projects can require
+# stricter (higher minimum) tiers than this; they cannot
+# loosen the policy below allowed_tiers_global.
+
+tier_policy:
+  # Tiers globally allowed in this deployment.
+  # Requests at any other tier are refused with HTTP 403.
+  allowed_tiers_global: [1, 2, 3, 4]
+  # Tier 5 (consumer/free endpoints) is disallowed by default
+
+  # Default minimum tier for non-privileged work.
+  default_minimum_tier: 4
+  # Most cloud providers under standard accounts are Tier 4;
+  # default of 4 means "use whatever's configured."
+
+  # Minimum tier when project.privileged = true.
+  privileged_minimum_tier: 3
+  # Privileged matters require enterprise ZDR or local
+  # inference. For most-sensitive work, operators set this to 1.
+
+  # Tiers that surface a warning in the chat UI.
+  # The user can still proceed; the warning is informational.
+  warn_on_tiers: [4, 5]
+
+# ============================================================
+# RATE LIMITING
+# ============================================================
+# Per-user, per-provider, per-model rate limits.
+# Backed by Redis token-bucket implementation.
+
+rate_limits:
+  per_user:
+    requests_per_minute: 60
+    tokens_per_minute: 100000
+    requests_per_day: 5000
+
+  per_provider:
+    anthropic-prod:
+      requests_per_minute: 200
+      tokens_per_minute: 500000
+    openai-prod:
+      requests_per_minute: 200
+      tokens_per_minute: 500000
+    ollama-local:
+      requests_per_minute: 30  # Local hardware constraint
+      tokens_per_minute: 50000
+
+  burst_allowance: 1.5  # Multiplier for short bursts above sustained rate
+
+# ============================================================
+# ANONYMIZATION (M2)
+# ============================================================
+# Pre/post middleware that pseudonymizes sensitive entities
+# before the model call and rehydrates after. Bypassed for
+# Tier 1 (local) inference where there's no benefit.
+
+anonymization:
+  enabled: false  # M2 middleware shipped + runs; off by default — opt in per deployment
+
+  # Apply when:
+  # - The request's routed tier is in apply_at_tiers, AND
+  # - The user has not opted out for the request, AND
+  # - The chat is not in a privileged Project (privilege analysis
+  #   complications outweigh the marginal benefit)
+  apply_at_tiers: [3, 4, 5]
+
+  # Entity types to pseudonymize
+  entity_types:
+    - person_name
+    - organization
+    - email_address
+    - phone_number
+    - address
+    - account_number
+    - case_number
+    - matter_number
+    - financial_amount  # Optional; can be too aggressive
+
+  # Pseudonym format: ENTITY_TYPE_NNNN
+  # e.g., PERSON_0001, ORG_0042, EMAIL_0007
+  # Mapping table is in-process memory only; never persisted
+
+  # Rehydration: replace pseudonyms in response and citations
+  # back to original values. Operates on response stream
+  # before sending back to backend.
+
+# ============================================================
+# CITATION ENGINE (PRD §3.3 / M2-C1)
+# ============================================================
+# The api/ side runs the Citation Engine cascade (exact-match →
+# tolerant-match → LLM paraphrase judge → ensemble). Stage 3
+# dispatches a judge call through this gateway; ``judge_model`` is
+# the alias the gateway resolves for that call.
+#
+# Defaults to ``fast`` so the judge runs on a smaller, cheaper
+# model than whatever generated the citation. Operators who want a
+# different judge model should pick one weaker than the
+# citation-generating model (the plan's calibration intuition: the
+# judge shouldn't be smarter than the author, only different).
+# Accepts either an alias from ``model_aliases:`` above or a fully-
+# qualified ``provider-name/model-name`` form.
+
+citation_engine:
+  judge_model: fast
+
+  # ----------------------------------------------------------------
+  # Stage 4 — ensemble verification (M2-D1)
+  # ----------------------------------------------------------------
+  # When activated, the paraphrase judge runs in parallel across
+  # ``judge_models`` and the verdicts aggregate under
+  # ``aggregation_rule``. Activation is the OR of:
+  #
+  #   1. A skill's frontmatter ``ensemble_verification: true``
+  #   2. The chat's project ``ensemble_verification`` flag
+  #   3. ``default_enabled`` below
+  #
+  # Replaces Stage 3 (single-judge) when activated. Cost-budget
+  # pre-flight: the api/ estimates spend per message
+  # (citations × n_judges × ~$0.005); if the estimate exceeds
+  # ``max_cost_per_message_usd`` the cascade falls back to single-
+  # judge Stage 3 with a warning logged.
+  #
+  # PRIVACY NOTE: each judge dispatch is an inference request that
+  # routes through the gateway like any other. If judge_models
+  # spans multiple provider tiers, the verification's privacy
+  # envelope is the *weakest* (highest-numbered) tier across the
+  # ensemble — exposed on ``message_citations.tier_envelope`` per
+  # row so operators can audit ensemble exposure post-hoc.
+  #
+  # Default is fully opt-in: empty ``judge_models`` disables Stage 4
+  # even when ``default_enabled: true`` (defense in depth against
+  # misconfiguration).
+  ensemble_verification:
+    default_enabled: false
+    judge_models: []
+    # ``strict`` — every judge must verdict verified. Any miss → MISS.
+    # ``majority`` — simple majority of verified verdicts wins;
+    #   even-N ties (e.g., 2-of-4) miss conservatively. Dissent
+    #   surfaces via the ``partial=true`` flag on the persisted row.
+    aggregation_rule: strict
+    max_cost_per_message_usd: 0.05
+  #
+  # Example operator configuration (commented for safety):
+  #
+  # ensemble_verification:
+  #   default_enabled: true
+  #   judge_models: [fast, fast-anthropic, fast-vertex]
+  #   aggregation_rule: strict
+  #   max_cost_per_message_usd: 0.10
+
+# ============================================================
+# COST TRACKING
+# ============================================================
+# Per-model cost rates for the cost tracker. Updated as
+# providers change pricing. Operator overrides allowed.
+
+cost_tracking:
+  enabled: true
+
+  # Cost per million tokens (input / output)
+  # Update these when provider pricing changes
+  rates:
+    'anthropic-prod/claude-opus-4-7':
+      input_per_mtok: 15.00
+      output_per_mtok: 75.00
+    'anthropic-prod/claude-sonnet-4-6':
+      input_per_mtok: 3.00
+      output_per_mtok: 15.00
+    'anthropic-prod/claude-haiku-4-5':
+      input_per_mtok: 0.80
+      output_per_mtok: 4.00
+    'openai-prod/gpt-5':
+      input_per_mtok: 1.25
+      output_per_mtok: 10.00
+    'openai-prod/gpt-5-mini':
+      input_per_mtok: 0.25
+      output_per_mtok: 2.00
+    'openai-prod/gpt-5-nano':
+      input_per_mtok: 0.05
+      output_per_mtok: 0.40
+    # Azure OpenAI — keyed by the Azure DEPLOYMENT-ID (the `models:` entries
+    # on the azure-openai provider above), NOT the underlying model name.
+    # Rates below mirror OpenAI GPT-5 list pricing; Azure enterprise
+    # agreements (ZDR / BAA / committed-use) and newer point releases
+    # (e.g. gpt-5.4) differ — confirm on the Azure OpenAI pricing page.
+    'azure-openai/gpt-5-prod':
+      input_per_mtok: 1.25
+      output_per_mtok: 10.00
+    'azure-openai/gpt-5-mini-prod':
+      input_per_mtok: 0.25
+      output_per_mtok: 2.00
+    'ollama-local/qwen3.5:9b':
+      input_per_mtok: 0.0  # Local; no per-token cost
+      output_per_mtok: 0.0
+    'ollama-local/qwen3.5:4b-nvfp4':
+      input_per_mtok: 0.0
+      output_per_mtok: 0.0
+    'ollama-local/gemma4:e4b':
+      input_per_mtok: 0.0
+      output_per_mtok: 0.0
+    # Embedding rates — OpenAI text-embedding-3-* charges only on
+    # input tokens; output_per_mtok is 0 (no generation). The
+    # embeddings success-row writer in the gateway uses these.
+    'openai-prod/text-embedding-3-small':
+      input_per_mtok: 0.02
+      output_per_mtok: 0.0
+    'openai-prod/text-embedding-3-large':
+      input_per_mtok: 0.13
+      output_per_mtok: 0.0
+
+  # Optional: budget alerts
+  budget_alerts:
+    daily_alert_threshold_usd: 50
+    weekly_alert_threshold_usd: 250
+    alert_email: ${BUDGET_ALERT_EMAIL:-admin@example.com}
+
+# ============================================================
+# TELEMETRY
+# ============================================================
+# Off by default. Operator opts in to specific sinks.
+
+telemetry:
+  opentelemetry:
+    enabled: ${OTEL_ENABLED:-false}
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+    service_name: lq-ai-gateway
+    service_version: ${LQ_AI_VERSION:-0.1.0}
+    # The gateway emits traces for: every inference request
+    # (with provider, model, tier, latency, cost), every
+    # refusal (with reason), every fallback (with both
+    # primary and fallback details).
+
+  langfuse:
+    enabled: ${LANGFUSE_ENABLED:-false}
+    public_key_env: LANGFUSE_PUBLIC_KEY
+    secret_key_env: LANGFUSE_SECRET_KEY
+    host: ${LANGFUSE_HOST:-http://langfuse:3000}
+    # Langfuse captures LLM-specific traces — full prompts,
+    # full responses, eval scores. Self-hosted langfuse
+    # keeps data in operator's environment.
+
+# ============================================================
+# CIRCUIT BREAKER
+# ============================================================
+# Provider-level failure handling. When a provider fails
+# repeatedly, the gateway routes to fallback and stops
+# attempting the failing provider for a cool-down period.
+
+circuit_breaker:
+  enabled: true
+  # Open the circuit after N consecutive failures
+  failure_threshold: 5
+  # Stay open for this many seconds before allowing a probe
+  recovery_timeout_seconds: 60
+  # When circuit is open, fall back per the model_aliases chain
+
+# ============================================================
+# REQUEST VALIDATION
+# ============================================================
+
+request_validation:
+  # Reject requests with absurd parameters
+  max_max_tokens: 16384
+  max_messages_per_request: 100
+  max_total_request_chars: 1000000  # ~250K tokens
+
+  # Refuse requests above this token count without explicit
+  # opt-in (prevents accidental large-context expensive calls)
+  large_context_threshold_tokens: 50000
+
+# ============================================================
+# DEVELOPMENT-MODE OVERRIDES
+# ============================================================
+# When running in dev mode, relax some safety checks.
+# Set LQ_AI_DEV_MODE=true to enable.
+
+dev_mode:
+  enabled: ${LQ_AI_DEV_MODE:-false}
+  bypass_rate_limits: false  # Even in dev, keep rate limits
+  log_full_prompts: false    # PII concerns even in dev
+  allow_tier_5: false        # Tier 5 stays disallowed

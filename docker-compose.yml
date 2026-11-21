@@ -1,0 +1,718 @@
+# LQ.AI — development docker-compose
+#
+# Default profile (no --profile flag): Mode 1 (cloud LLM keys via Inference Gateway).
+# Local-inference profile (--profile local): adds the ollama container for local (Tier 1) inference.
+#
+# Per PRD §6.1 and ADR 0001 (OpenWebUI fork pin v0.9.2).
+#
+# Quick start:
+#   cp .env.example .env
+#   # edit .env — set LQ_AI_GATEWAY_KEY, JWT_SECRET, POSTGRES_PASSWORD,
+#   # OBJECT_STORE_SECRET_KEY (or legacy MINIO_ROOT_PASSWORD), and at least one provider API key
+#   docker compose up -d
+#
+# Air-gapped / Mode 2:
+#   docker compose --profile local up -d
+
+name: lq-ai
+
+services:
+  # ============================================================
+  # Storage (PRD §2.1)
+  # ============================================================
+
+  postgres:
+    # Digest-pinned for reproducible boots (matches the pin in
+    # .github/workflows/ci.yml). Bump the tag and digest together.
+    image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-lq_ai}
+      POSTGRES_USER: ${POSTGRES_USER:-lq_ai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_BIND_ADDR:-127.0.0.1}:${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-lq_ai} -d $${POSTGRES_DB:-lq_ai}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    # Digest-pinned for reproducible boots. Bump the tag and digest together.
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "${REDIS_BIND_ADDR:-127.0.0.1}:${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rustfs-init:
+    image: lq-ai-api:latest
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    restart: "no"
+    entrypoint: ["python", "-m", "app.ops.gate"]
+    environment:
+      LQ_AI_OBJECTSTORE_DIR: /lq-ai/volumes/objectstore
+      LQ_AI_OPS_DIR: /lq-ai/ops
+      LQ_AI_OPS_UNATTENDED: ${LQ_AI_OPS_UNATTENDED:-0}
+      # Translate the 0.x compatibility key before the gate validates it.
+      OBJECT_STORE_SECRET_KEY: ${OBJECT_STORE_SECRET_KEY:-${MINIO_ROOT_PASSWORD:-}}
+    volumes:
+      - miniodata:/lq-ai/volumes/objectstore
+      - ${LQ_AI_OPS_SOURCE:-lq-ai-ops}:/lq-ai/ops:ro
+
+  rustfs:
+    # ADR 0036: pin the GA multi-arch index, not a floating tag.
+    image: rustfs/rustfs:1.0.3@sha256:9ca9559533b537d10482fe923288b676ad08f92a7069d9a17327fbae3cab688b
+    restart: unless-stopped
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      # RustFS requires vendor-specific process variable names. Operators use
+      # the vendor-neutral OBJECT_STORE_* contract; MINIO_* is the 0.x shim.
+      RUSTFS_ACCESS_KEY: ${OBJECT_STORE_ACCESS_KEY:-${MINIO_ROOT_USER:-lq_ai}}
+      RUSTFS_SECRET_KEY: ${OBJECT_STORE_SECRET_KEY:-${MINIO_ROOT_PASSWORD:-}}
+    volumes:
+      # RustFS seeds /data/.rustfs in its image. Container creation happens
+      # before rustfs-init runs; copy-up would make a fresh volume look unknown.
+      - type: volume
+        source: miniodata
+        target: /data
+        volume:
+          nocopy: true
+    ports:
+      - "${OBJECT_STORE_BIND_ADDR:-${MINIO_BIND_ADDR:-127.0.0.1}}:${OBJECT_STORE_API_HOST_PORT:-${MINIO_API_HOST_PORT:-9000}}:9000"
+      - "${OBJECT_STORE_BIND_ADDR:-${MINIO_BIND_ADDR:-127.0.0.1}}:${OBJECT_STORE_CONSOLE_HOST_PORT:-${MINIO_CONSOLE_HOST_PORT:-9001}}:9001"
+    networks:
+      default:
+        aliases:
+          # Canonical endpoint for new installs; does not encode the bundled vendor.
+          - object-store
+          # Supported through at least v0.10.0 (and, per ADR 0036, all 0.x):
+          # existing .env files pin http://minio:9000.
+          - minio
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/health/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  migrate:
+    profiles: ["ops"]
+    image: lq-ai-api:latest
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    user: "0:0"
+    entrypoint: ["python", "-m", "app.ops.migrate"]
+    command: ["status"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-lq_ai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lq_ai}}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://object-store:9000}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-${OBJECT_STORE_ACCESS_KEY:-${MINIO_ROOT_USER:-lq_ai}}}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-${OBJECT_STORE_SECRET_KEY:-${MINIO_ROOT_PASSWORD:-}}}
+      S3_BUCKET: ${S3_BUCKET:-lq-ai-files}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      LQ_AI_OBJECTSTORE_DIR: /lq-ai/volumes/objectstore
+      LQ_AI_OPS_DIR: /lq-ai/ops
+      LQ_AI_SNAPSHOT_DIR: ${LQ_AI_SNAPSHOT_DIR:-/lq-ai/ops/snapshots}
+      LQ_AI_OPS_ACTOR: ${LQ_AI_OPS_ACTOR:-cli}
+    volumes:
+      - miniodata:/lq-ai/volumes/objectstore
+      - ${LQ_AI_OPS_SOURCE:-lq-ai-ops}:/lq-ai/ops
+
+  # ============================================================
+  # Application services (PRD §2.1)
+  # ============================================================
+
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Auth — backend → gateway (and gateway → backend for C2 skill fetches).
+      # The gateway uses the SAME shared secret in BOTH directions.
+      LQ_AI_GATEWAY_KEY: ${LQ_AI_GATEWAY_KEY:?LQ_AI_GATEWAY_KEY is required}
+      # Enables the runtime encrypted-at-rest key store (ADR 0011). Optional for
+      # boot, but forwarded so `docker compose up` supports the in-app admin key
+      # setters — Configure → Provider keys AND Admin → Research sources (enable
+      # CourtListener/GovInfo). Without it those write endpoints return
+      # 400 failed_precondition. Defaults empty (runtime key storage disabled);
+      # set it in .env to enable. Mirrors docker-compose.release.yml.
+      LQ_AI_GATEWAY_MASTER_KEY: ${LQ_AI_GATEWAY_MASTER_KEY:-}
+      # C2 — backend HTTP client for skill prompt assembly (ADR 0007).
+      LQ_AI_API_URL: ${LQ_AI_API_URL:-http://api:8000}
+      LQ_AI_SKILL_CACHE_TTL_SECONDS: ${LQ_AI_SKILL_CACHE_TTL_SECONDS:-60}
+      # B4 — inference_routing_log writer (audit trail of every routed
+      # request). Optional: without DATABASE_URL the gateway logs a
+      # warning at startup and runs in NullRoutingLogWriter mode.
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-lq_ai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lq_ai}}
+      # Provider keys (any of these may be unset; gateway.yaml picks which to use)
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_BEARER_TOKEN_BEDROCK: ${AWS_BEARER_TOKEN_BEDROCK:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_RESOURCE: ${AZURE_OPENAI_RESOURCE:-}
+      # Tool-provider keys (legal-research + MCP milestone). Forwarded so an
+      # enabled tool_providers entry in gateway.yaml whose `api_key_env:` names
+      # COURTLISTENER_API_TOKEN resolves at config-load time. Unset by default
+      # (case-law is operator-opt-in: uncomment the courtlistener block in
+      # gateway.yaml AND set this token to enable). See gateway.yaml.example.
+      COURTLISTENER_API_TOKEN: ${COURTLISTENER_API_TOKEN:-}
+      # B6 partial — Ollama (Mode-2 / Tier-1). Forwarded so the
+      # gateway.yaml's ${OLLAMA_BASE_URL:-http://ollama:11434}
+      # placeholder resolves at config-load time. Operators running
+      # Ollama on the host set OLLAMA_BASE_URL=http://host.docker.internal:11434
+      # in their .env; default reaches the in-Compose `ollama` service
+      # (`--profile local up`).
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      # Observability
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+      # Operational
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LQ_AI_DEV_MODE: ${LQ_AI_DEV_MODE:-false}
+    # D0.5 — gateway.yaml is now mutable at runtime via the admin
+    # alias-CRUD surface (ADR 0010). Two related volumes:
+    #
+    # 1. ``./gateway.yaml.example`` is mounted RO so the entrypoint
+    #    script can seed the writable copy from it on first boot.
+    # 2. A named volume ``gateway-config`` holds the writable
+    #    ``gateway.yaml`` between container restarts. Operators who
+    #    want to edit the config in their host filesystem replace
+    #    this with a host-path bind mount; operators who want
+    #    immutable config (a hardened deployment) bind-mount their
+    #    own ``gateway.yaml`` directly with ``:ro`` and accept that
+    #    the admin write endpoints will fail.
+    #
+    # The entrypoint sets GATEWAY_CONFIG_PATH=/etc/lq-ai/gateway.yaml
+    # automatically when the directory mount is present.
+    volumes:
+      # Seed file (read-only). The entrypoint copies this into the
+      # writable named volume on first boot.
+      - ${GATEWAY_CONFIG_FILE:-./gateway.yaml.example}:/usr/share/lq-ai/gateway.yaml.example:ro
+      # Writable directory for the live gateway.yaml. Hot-reload (D0.5)
+      # writes to this directory atomically (temp + rename) and the
+      # named volume persists the file across container restarts.
+      - gateway-config:/etc/lq-ai
+    ports:
+      - "${GATEWAY_BIND_ADDR:-127.0.0.1}:${GATEWAY_HOST_PORT:-8001}:8001"
+    healthcheck:
+      # python:3.12-slim has no curl; use stdlib urllib instead
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/health', timeout=2).status == 200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      # Database
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-lq_ai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lq_ai}}
+      # Cache and queue
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # Object storage
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://object-store:9000}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-${OBJECT_STORE_ACCESS_KEY:-${MINIO_ROOT_USER:-lq_ai}}}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-${OBJECT_STORE_SECRET_KEY:-${MINIO_ROOT_PASSWORD:-}}}
+      S3_BUCKET: ${S3_BUCKET:-lq-ai-files}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      # Inference Gateway
+      LQ_AI_GATEWAY_URL: ${LQ_AI_GATEWAY_URL:-http://gateway:8001}
+      LQ_AI_GATEWAY_TIMEOUT_SECONDS: ${LQ_AI_GATEWAY_TIMEOUT_SECONDS:-900}
+      LQ_AI_GATEWAY_KEY: ${LQ_AI_GATEWAY_KEY:?LQ_AI_GATEWAY_KEY is required}
+      # Autonomous sessions (#681): fallback model the analysis node passes to
+      # the gateway when a watch/schedule trigger pins none. Defaults to the
+      # ``smart`` alias so it follows the gateway routing table; set it when
+      # the gateway does not route that alias. Shared with arq-worker —
+      # recreate both services after changing it.
+      LQ_AI_AUTONOMOUS_DEFAULT_MODEL: ${LQ_AI_AUTONOMOUS_DEFAULT_MODEL:-smart}
+      # Shared with arq-worker so chat and autonomous calls apply one default.
+      LQ_AI_TOOL_MAX_EGRESS_TIER: ${LQ_AI_TOOL_MAX_EGRESS_TIER:-}
+      # JWT (auth — per ADR 0002 the backend owns auth)
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      # Ordinary reference reads have an independent host switch, shared with workers.
+      LQ_AI_SKILL_REFERENCE_READ_ENABLED: ${LQ_AI_SKILL_REFERENCE_READ_ENABLED:-true}
+      JWT_ACCESS_TOKEN_TTL_SECONDS: ${JWT_ACCESS_TOKEN_TTL_SECONDS:-900}
+      JWT_REFRESH_TOKEN_TTL_SECONDS: ${JWT_REFRESH_TOKEN_TTL_SECONDS:-604800}
+      # Observability
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      # Operational
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LQ_AI_DEV_MODE: ${LQ_AI_DEV_MODE:-false}
+      # CORS — empty disables. Production behind a same-origin reverse
+      # proxy: leave unset. Local Compose dev: http://localhost:3000.
+      LQ_AI_CORS_ORIGINS: ${LQ_AI_CORS_ORIGINS:-}
+      # Skills loader — C1 walks this directory at startup. Mounted
+      # read-only so the container can only consume the skills filesystem,
+      # not mutate it (skill authoring is a host-side / human-attestation
+      # workflow per CLAUDE.md "Working with skills").
+      LQ_AI_SKILLS_DIR: ${LQ_AI_SKILLS_DIR:-/skills}
+      LQ_AI_ORCHESTRATION_CHAT_ENABLED: ${LQ_AI_ORCHESTRATION_CHAT_ENABLED:-false}
+      LQ_AI_ORCHESTRATION_CHAT_PROJECT_ID: ${LQ_AI_ORCHESTRATION_CHAT_PROJECT_ID:-}
+      LQ_AI_ORCHESTRATION_CHAT_PROVIDER: ${LQ_AI_ORCHESTRATION_CHAT_PROVIDER:-}
+      LQ_AI_ORCHESTRATION_CHAT_MODEL: ${LQ_AI_ORCHESTRATION_CHAT_MODEL:-}
+      LQ_AI_ORCHESTRATION_CHAT_BUDGET_USD: ${LQ_AI_ORCHESTRATION_CHAT_BUDGET_USD:-2.0000}
+      LQ_AI_ORCHESTRATION_CHAT_MINIMUM_TIER: ${LQ_AI_ORCHESTRATION_CHAT_MINIMUM_TIER:-1}
+      LQ_AI_ORCHESTRATION_CHAT_TIMEOUT_SECONDS: ${LQ_AI_ORCHESTRATION_CHAT_TIMEOUT_SECONDS:-120}
+      LQ_AI_ORCHESTRATION_DEPLOYMENT_CHILDREN: ${LQ_AI_ORCHESTRATION_DEPLOYMENT_CHILDREN:-2}
+      # ADR 0038 D1, D3: New harness, the run profile the chat composer offers as
+      # an experimental model. Its own switch and its own pinned route; nothing is
+      # inherited from the fictional one.
+      LQ_AI_NEW_HARNESS_ENABLED: ${LQ_AI_NEW_HARNESS_ENABLED:-false}
+      LQ_AI_NEW_HARNESS_PROVIDER: ${LQ_AI_NEW_HARNESS_PROVIDER:-}
+      LQ_AI_NEW_HARNESS_MODEL: ${LQ_AI_NEW_HARNESS_MODEL:-}
+      LQ_AI_NEW_HARNESS_BUDGET_USD: ${LQ_AI_NEW_HARNESS_BUDGET_USD:-5.0000}
+      LQ_AI_NEW_HARNESS_MINIMUM_TIER: ${LQ_AI_NEW_HARNESS_MINIMUM_TIER:-1}
+      LQ_AI_NEW_HARNESS_TIMEOUT_SECONDS: ${LQ_AI_NEW_HARNESS_TIMEOUT_SECONDS:-300}
+      LQ_AI_NEW_HARNESS_REASONING_EFFORT: ${LQ_AI_NEW_HARNESS_REASONING_EFFORT:-}
+      LQ_AI_SKILL_WORKSPACES_ENABLED: ${LQ_AI_SKILL_WORKSPACES_ENABLED:-false}
+      LQ_AI_SKILL_SCRIPT_RUNNER_URL: ${LQ_AI_SKILL_SCRIPT_RUNNER_URL:-}
+      LQ_AI_SKILL_SCRIPT_RUNNER_TOKEN: ${LQ_AI_SKILL_SCRIPT_RUNNER_TOKEN:-}
+      # M3-D1 slack-bridge integration. Both optional: only required for
+      # operators who enable the `slack` compose profile. The api refuses
+      # bridge traffic with 500 when either is unset.
+      LQ_AI_BRIDGE_TOKEN: ${LQ_AI_BRIDGE_TOKEN:-}
+      LQ_AI_BRIDGE_MASTER_KEY: ${LQ_AI_BRIDGE_MASTER_KEY:-}
+      # Fernet master key for per-user MCP OAuth tokens AND the
+      # chat pending-tool-call resume payload (DE-358 item 5). Required
+      # when MCP OAuth or the chat tool-confirmation gate is used; the
+      # persist paths fail closed (no plaintext writes) when unset.
+      LQ_AI_MCP_MASTER_KEY: ${LQ_AI_MCP_MASTER_KEY:-}
+    volumes:
+      - ./skills:/skills:ro
+    ports:
+      - "${API_BIND_ADDR:-127.0.0.1}:${API_HOST_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ingest-worker:
+    # C5 document pipeline worker. arq-backed; consumes ingest jobs
+    # from Redis and writes parsed documents + chunks to Postgres.
+    # See `docs/adr/0006-document-pipeline-architecture.md` for the
+    # mechanism rationale.
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+      # DE-326: the api is the single schema migrator. Wait for it to be
+      # healthy (entrypoint runs `alembic upgrade head` before serving) so
+      # this worker never touches an unmigrated DB and never races the api's
+      # migration. Paired with LQ_AI_SKIP_MIGRATIONS=1 below.
+      api:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-lq_ai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lq_ai}}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # DE-326: the api owns migrations; this worker must NOT run
+      # `alembic upgrade head` on boot. The worker image does not mount
+      # ./skills, so migration 0032 (seed builtin NDA playbooks, which reads
+      # /skills/playbooks/nda/playbook.yaml) would raise on a fresh install.
+      # Skipping is safe because the api (above) migrates to head first.
+      LQ_AI_SKIP_MIGRATIONS: "1"
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://object-store:9000}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-${OBJECT_STORE_ACCESS_KEY:-${MINIO_ROOT_USER:-lq_ai}}}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-${OBJECT_STORE_SECRET_KEY:-${MINIO_ROOT_PASSWORD:-}}}
+      S3_BUCKET: ${S3_BUCKET:-lq-ai-files}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      LQ_AI_INGEST_WORKER_CONCURRENCY: ${LQ_AI_INGEST_WORKER_CONCURRENCY:-2}
+      LQ_AI_DOCLING_TIMEOUT_SECONDS: ${LQ_AI_DOCLING_TIMEOUT_SECONDS:-300}
+      LQ_AI_DOCLING_ENABLED: ${LQ_AI_DOCLING_ENABLED:-true}
+      LQ_AI_CHUNK_TARGET_CHARS: ${LQ_AI_CHUNK_TARGET_CHARS:-2000}
+      LQ_AI_CHUNK_OVERLAP_CHARS: ${LQ_AI_CHUNK_OVERLAP_CHARS:-200}
+      # Gateway endpoint + auth — required by `embed_chunks_for_file_job`
+      # which calls `POST {LQ_AI_GATEWAY_URL}/v1/embeddings` to vectorise
+      # each freshly-ingested chunk. Without these vars the embed step
+      # silently fails with `chunks_embedded: 0`, leaving chunks with
+      # NULL embeddings — KB hybrid_search then has no vector half to
+      # work with even on KBs configured for hybrid retrieval
+      # (`hybrid_alpha < 1.0`).
+      LQ_AI_GATEWAY_URL: ${LQ_AI_GATEWAY_URL:-http://gateway:8001}
+      LQ_AI_GATEWAY_TIMEOUT_SECONDS: ${LQ_AI_GATEWAY_TIMEOUT_SECONDS:-900}
+      LQ_AI_GATEWAY_KEY: ${LQ_AI_GATEWAY_KEY:?LQ_AI_GATEWAY_KEY is required}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    # Persist Docling's Hugging Face model cache and EasyOCR's detection
+    # model cache across container restarts so the operator only pays
+    # the first-run download cost once per host (not once per container).
+    # Without these volumes, every `docker compose down`/`up` re-downloads
+    # ~700MB of models on the first ingestion, blocking the user for ~1
+    # minute. See `docs/adr/0006-document-pipeline-architecture.md`.
+    volumes:
+      - ingest-hf-cache:/root/.cache/huggingface
+      - ingest-easyocr-cache:/root/.EasyOCR
+    # arq's CLI discovers WorkerSettings from the dotted module path.
+    # The image's WORKDIR is /app, so app.workers.* resolves directly.
+    command: ["arq", "app.workers.document_pipeline.WorkerSettings"]
+    healthcheck:
+      # arq doesn't expose an HTTP healthcheck; use a Python check that
+      # the redis pool is reachable. The worker process won't accept
+      # jobs without it, so this proxies "is the worker running" well
+      # enough for compose's `condition: service_healthy`.
+      test:
+        ["CMD", "python", "-c", "import os; from redis import Redis; r = Redis.from_url(os.environ['REDIS_URL']); r.ping()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  arq-worker:
+    # M3-A6 worker. Sister to `ingest-worker`; same image, same Redis,
+    # but consumes from the dedicated `arq:m3a6` queue so long-running
+    # easy-playbook generation jobs (PRD §3.7: up to 10 minutes for a
+    # 10-document corpus) do not delay document ingest and vice versa.
+    # Phase 1 registers only a noop task; Phase 5 of M3-A6 adds the
+    # easy-playbook generation function. See
+    # `api/app/workers/arq_setup.py` for the WorkerSettings.
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # DE-326: the api is the single schema migrator. Wait for it to be
+      # healthy so this worker never touches an unmigrated DB and never
+      # races the api's migration. Paired with LQ_AI_SKIP_MIGRATIONS=1 below.
+      api:
+        condition: service_healthy
+    environment:
+      # The worker opens DB sessions in its on_shutdown hook (and Phase
+      # 5 will add the easy-playbook generation pipeline that reads
+      # source documents). Same env wiring as the api/ingest-worker.
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-lq_ai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lq_ai}}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # DE-326: the api owns migrations; this worker must NOT run
+      # `alembic upgrade head` on boot — the api is the single schema
+      # migrator and runs first. (This worker NOW mounts ./skills — see
+      # volumes below — because the shared registry bootstrap installs
+      # the skill registry at worker startup so skill_ref autonomous
+      # sessions resolve here; the old "no ./skills mount" caveat about
+      # migration 0032 no longer applies. DE-326 remains the operative
+      # reason to skip.)
+      LQ_AI_SKIP_MIGRATIONS: "1"
+      # Gateway endpoint + auth — required by Phase 5's easy-playbook
+      # extractor which calls the inference gateway. Pre-wired now so
+      # Phase 5 doesn't need a second docker-compose edit.
+      LQ_AI_GATEWAY_URL: ${LQ_AI_GATEWAY_URL:-http://gateway:8001}
+      LQ_AI_GATEWAY_TIMEOUT_SECONDS: ${LQ_AI_GATEWAY_TIMEOUT_SECONDS:-900}
+      LQ_AI_GATEWAY_KEY: ${LQ_AI_GATEWAY_KEY:?LQ_AI_GATEWAY_KEY is required}
+      # Autonomous sessions (#681): fallback model the analysis node passes to
+      # the gateway when a watch/schedule trigger pins none. Defaults to the
+      # ``smart`` alias so it follows the gateway routing table; set it when
+      # the gateway does not route that alias. Same value as the api service —
+      # recreate both services after changing it.
+      LQ_AI_AUTONOMOUS_DEFAULT_MODEL: ${LQ_AI_AUTONOMOUS_DEFAULT_MODEL:-smart}
+      LQ_AI_TOOL_MAX_EGRESS_TIER: ${LQ_AI_TOOL_MAX_EGRESS_TIER:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Observability. The worker executes governed runs, so it exports spans
+      # like the api does; a run's trace then connects the request, this worker,
+      # the gateway and the provider (ADR 0038 D2). Empty disables export.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: ${LQ_AI_ARQ_WORKER_OTEL_SERVICE_NAME:-lq-ai-arq-worker}
+      LQ_AI_SKILL_REFERENCE_READ_ENABLED: ${LQ_AI_SKILL_REFERENCE_READ_ENABLED:-true}
+      # Skills loader — the worker's on_startup installs the skill
+      # registry via the shared bootstrap (app/skills/bootstrap.py) so
+      # skill_ref autonomous sessions resolve on this process. Mounted
+      # read-only so the container can only consume the skills filesystem,
+      # not mutate it (skill authoring is a host-side / human-attestation
+      # workflow per CLAUDE.md "Working with skills").
+      LQ_AI_SKILLS_DIR: ${LQ_AI_SKILLS_DIR:-/skills}
+      LQ_AI_ORCHESTRATION_CHAT_ENABLED: ${LQ_AI_ORCHESTRATION_CHAT_ENABLED:-false}
+      LQ_AI_ORCHESTRATION_CHAT_PROJECT_ID: ${LQ_AI_ORCHESTRATION_CHAT_PROJECT_ID:-}
+      LQ_AI_ORCHESTRATION_CHAT_PROVIDER: ${LQ_AI_ORCHESTRATION_CHAT_PROVIDER:-}
+      LQ_AI_ORCHESTRATION_CHAT_MODEL: ${LQ_AI_ORCHESTRATION_CHAT_MODEL:-}
+      LQ_AI_ORCHESTRATION_CHAT_BUDGET_USD: ${LQ_AI_ORCHESTRATION_CHAT_BUDGET_USD:-2.0000}
+      LQ_AI_ORCHESTRATION_CHAT_MINIMUM_TIER: ${LQ_AI_ORCHESTRATION_CHAT_MINIMUM_TIER:-1}
+      LQ_AI_ORCHESTRATION_CHAT_TIMEOUT_SECONDS: ${LQ_AI_ORCHESTRATION_CHAT_TIMEOUT_SECONDS:-120}
+      LQ_AI_ORCHESTRATION_DEPLOYMENT_CHILDREN: ${LQ_AI_ORCHESTRATION_DEPLOYMENT_CHILDREN:-2}
+      # ADR 0038 D1, D3: New harness, the run profile the chat composer offers as
+      # an experimental model. Its own switch and its own pinned route; nothing is
+      # inherited from the fictional one.
+      LQ_AI_NEW_HARNESS_ENABLED: ${LQ_AI_NEW_HARNESS_ENABLED:-false}
+      LQ_AI_NEW_HARNESS_PROVIDER: ${LQ_AI_NEW_HARNESS_PROVIDER:-}
+      LQ_AI_NEW_HARNESS_MODEL: ${LQ_AI_NEW_HARNESS_MODEL:-}
+      LQ_AI_NEW_HARNESS_BUDGET_USD: ${LQ_AI_NEW_HARNESS_BUDGET_USD:-5.0000}
+      LQ_AI_NEW_HARNESS_MINIMUM_TIER: ${LQ_AI_NEW_HARNESS_MINIMUM_TIER:-1}
+      LQ_AI_NEW_HARNESS_TIMEOUT_SECONDS: ${LQ_AI_NEW_HARNESS_TIMEOUT_SECONDS:-300}
+      LQ_AI_NEW_HARNESS_REASONING_EFFORT: ${LQ_AI_NEW_HARNESS_REASONING_EFFORT:-}
+      LQ_AI_SKILL_WORKSPACES_ENABLED: ${LQ_AI_SKILL_WORKSPACES_ENABLED:-false}
+      LQ_AI_SKILL_SCRIPT_RUNNER_URL: ${LQ_AI_SKILL_SCRIPT_RUNNER_URL:-}
+      LQ_AI_SKILL_SCRIPT_RUNNER_TOKEN: ${LQ_AI_SKILL_SCRIPT_RUNNER_TOKEN:-}
+      # Same key as the api service — worker code paths that touch
+      # envelope-encrypted payloads (DE-358 item 5) or per-user MCP
+      # OAuth tokens need it to decrypt/encrypt.
+      LQ_AI_MCP_MASTER_KEY: ${LQ_AI_MCP_MASTER_KEY:-}
+    volumes:
+      - ./skills:/skills:ro
+    command: ["arq", "app.workers.arq_setup.WorkerSettings"]
+    healthcheck:
+      # Same proxy as ingest-worker: redis-reachability stands in for
+      # arq-worker-liveness because the worker can't process jobs
+      # without redis.
+      test:
+        ["CMD", "python", "-c", "import os; from redis import Redis; r = Redis.from_url(os.environ['REDIS_URL']); r.ping()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  web:
+    # OpenWebUI fork imported at v0.9.2 per ADR 0001 (Task A1.d).
+    # Customizations land progressively: A5 (branding + delegated-auth wiring),
+    # D2 (tier badge), and others. The container builds upstream-as-is in M1's
+    # initial state.
+    #
+    # Word add-in (M3-B1) integration: the webpack build at
+    # `word-addin/` outputs to `web/static/word-addin/` which the web
+    # Dockerfile's `COPY . .` in the SvelteKit build stage picks up
+    # automatically. Run `cd word-addin && npm install && npm run build`
+    # once before `docker compose up --build` to populate the directory;
+    # see `word-addin/README.md` for the full build flow. A future DE
+    # may add an automated build stage to this compose file or to the
+    # web Dockerfile so the manual step is no longer required.
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        # Vite/SvelteKit bakes PUBLIC_* env vars into the static build.
+        # Production deployments front web + api at the same origin via
+        # a reverse proxy and leave this UNSET (relative /api/v1).
+        # Local Compose dev sets it to http://localhost:8000/api/v1 in
+        # .env so the LQ.AI shell at :3000 can talk to the api at :8000.
+        PUBLIC_LQ_AI_API_BASE_URL: ${PUBLIC_LQ_AI_API_BASE_URL:-/api/v1}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      # Backend delegation (per ADR 0002 — backend owns auth)
+      LQ_AI_API_URL: ${LQ_AI_API_URL:-http://api:8000}
+      WEBUI_AUTH: ${WEBUI_AUTH:-false}
+      WEBUI_NAME: ${WEBUI_NAME:-LQ.AI}
+      WEBUI_URL: ${WEBUI_URL:-http://localhost:3000}
+      # DE-353: LQ.AI does its own embeddings/citations in api+gateway; OpenWebUI's
+      # local RAG is unused. A non-empty engine makes get_ef() return None instead
+      # of building a local SentenceTransformer at import, skipping the boot-time
+      # "Fetching 30 files" HuggingFace download that otherwise delays web health.
+      RAG_EMBEDDING_ENGINE: ${RAG_EMBEDDING_ENGINE:-openai}
+      # OpenWebUI's full env-var surface (DATABASE_URL, OLLAMA_BASE_URL,
+      # ENABLE_*, etc.) lands when Task A1.d imports the fork and we know
+      # the exact set to override vs. default.
+    ports:
+      - "${WEB_BIND_ADDR:-127.0.0.1}:${WEB_HOST_PORT:-3000}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ============================================================
+  # Mode 2 — local inference (PRD §1.5.1, §6.1)
+  # Only started with --profile local
+  # ============================================================
+
+  ollama:
+    # Digest-pinned: `latest` alone is not reproducible. Bump the digest
+    # deliberately (re-resolve `ollama/ollama:latest`) rather than drifting.
+    image: ollama/ollama:latest@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc
+    profiles: ["local"]
+    restart: unless-stopped
+    volumes:
+      - ollamadata:/root/.ollama
+    ports:
+      - "${OLLAMA_BIND_ADDR:-127.0.0.1}:${OLLAMA_HOST_PORT:-11434}:11434"
+    healthcheck:
+      # Ollama exposes /api/tags as the cheapest GET; a 200 means the
+      # server is up (models are loaded lazily on first inference, so
+      # we don't probe model presence here — `docker compose exec
+      # ollama ollama pull <model>` is the operator's responsibility).
+      # The ollama/ollama image ships /bin/ollama itself; we shell out
+      # to it instead of curl (which the image doesn't ship).
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    # GPU acceleration is operator-configured; uncomment when nvidia-docker
+    # is available.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # NOTE: a `paddleocr` sidecar (image `legalquants/paddleocr-vl:latest`) was
+  # previously sketched here under the `local` profile for scanned-PDF OCR.
+  # It was never implemented: the image was never published and the
+  # placeholder entrypoint only printed "lands in M2", yet its presence forced
+  # `docker compose --profile local up` to attempt the (missing) pull and abort
+  # the whole profile — including the ollama sidecar (issue #99). Scanned-PDF
+  # OCR is genuinely not implemented; the ingestion pipeline is PyMuPDF +
+  # Docling and sets `was_ocrd=False` (api/app/pipeline/ingest.py). The sidecar
+  # has been removed; real OCR is tracked as DE-320. `--profile local` now adds
+  # only the `ollama` sidecar.
+
+  # ============================================================
+  # Integration bridges (PRD §3.15 — opt-in by Compose profile)
+  # ============================================================
+
+  slack-bridge:
+    # M3-D1 — Slack OAuth + webhook bridge. Gated by the ``slack``
+    # profile so operators who don't use Slack don't pay the SBOM cost
+    # or run a service they have nothing to do with.
+    #
+    # Bring up with: ``docker compose --profile slack up -d slack-bridge``
+    #
+    # Credentials come from the operator's Slack App admin UI
+    # (SLACK_CLIENT_ID / SLACK_CLIENT_SECRET / SLACK_SIGNING_SECRET);
+    # LQ_AI_BRIDGE_TOKEN is the shared secret the bridge presents on
+    # internal calls to the api (the api validates with the same env
+    # var). LQ_AI_BRIDGE_PUBLIC_URL is the externally reachable URL
+    # Slack will hit on OAuth callback — operators typically front
+    # this with their reverse proxy.
+    build:
+      context: ./slack-bridge
+      dockerfile: Dockerfile
+    profiles: ["slack"]
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      # Slack-side credentials (operator obtains from Slack App admin UI)
+      SLACK_CLIENT_ID: ${SLACK_CLIENT_ID:-}
+      SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET:-}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
+      # LQ.AI-side coordinates
+      LQ_AI_BACKEND_URL: ${LQ_AI_BACKEND_URL:-http://api:8000}
+      LQ_AI_BRIDGE_TOKEN: ${LQ_AI_BRIDGE_TOKEN:-}
+      LQ_AI_BRIDGE_PUBLIC_URL: ${LQ_AI_BRIDGE_PUBLIC_URL:-}
+      # Observability (opt-in)
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-lq-ai-slack-bridge}
+      LQ_AI_BRIDGE_LOG_LEVEL: ${LQ_AI_BRIDGE_LOG_LEVEL:-INFO}
+    ports:
+      - "${SLACK_BRIDGE_BIND_ADDR:-127.0.0.1}:${SLACK_BRIDGE_HOST_PORT:-8002}:8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8002/healthz', timeout=2).status == 200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  teams-bridge:
+    # M3-D3 — Microsoft Teams OAuth bridge. Gated by the ``teams``
+    # profile so operators who don't use Teams don't pay the SBOM
+    # cost or run a service they have nothing to do with.
+    #
+    # Bring up with: ``docker compose --profile teams up -d teams-bridge``
+    #
+    # Credentials come from the operator's Azure AD app registration
+    # (MICROSOFT_APP_ID + MICROSOFT_APP_PASSWORD); LQ_AI_BRIDGE_TOKEN
+    # is REUSED from the slack-bridge per M3-D3 decision #2 (same
+    # bearer authenticates both bridges to the api).
+    # LQ_AI_TEAMS_BRIDGE_PUBLIC_URL is the externally reachable URL
+    # Microsoft will hit on OAuth callback — typically fronted by the
+    # operator's reverse proxy.
+    build:
+      context: ./teams-bridge
+      dockerfile: Dockerfile
+    profiles: ["teams"]
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      # Microsoft-side credentials (Azure AD multi-tenant app)
+      MICROSOFT_APP_ID: ${MICROSOFT_APP_ID:-}
+      MICROSOFT_APP_PASSWORD: ${MICROSOFT_APP_PASSWORD:-}
+      # LQ.AI-side coordinates
+      LQ_AI_BACKEND_URL: ${LQ_AI_BACKEND_URL:-http://api:8000}
+      LQ_AI_BRIDGE_TOKEN: ${LQ_AI_BRIDGE_TOKEN:-}
+      LQ_AI_TEAMS_BRIDGE_PUBLIC_URL: ${LQ_AI_TEAMS_BRIDGE_PUBLIC_URL:-}
+      # Observability (opt-in)
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-lq-ai-teams-bridge}
+      LQ_AI_TEAMS_BRIDGE_LOG_LEVEL: ${LQ_AI_TEAMS_BRIDGE_LOG_LEVEL:-INFO}
+    ports:
+      - "${TEAMS_BRIDGE_BIND_ADDR:-127.0.0.1}:${TEAMS_BRIDGE_HOST_PORT:-8003}:8003"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8003/healthz', timeout=2).status == 200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+# ============================================================
+# Persistent volumes (PRD §6.5)
+# ============================================================
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  lq-ai-ops:
+  ollamadata:
+  # D0.5 — writable directory for the gateway's runtime gateway.yaml.
+  # Seeded from the repo's gateway.yaml.example on first boot via the
+  # gateway entrypoint script. See ADR 0010.
+  gateway-config:
+  # Caches for the ingest-worker. Persisting these volumes across
+  # `docker compose down` cycles avoids repeated ~700MB model downloads
+  # on first ingestion. Per ADR 0006 (document pipeline architecture).
+  ingest-hf-cache:
+  ingest-easyocr-cache:

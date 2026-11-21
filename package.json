@@ -1,0 +1,25 @@
+{
+  "name": "lq-ai",
+  "version": "1.0.0",
+  "description": "Open-source AI platform purpose-built for legal teams. Bring your own keys, run it where you want, own your data.",
+  "author": "Abdullah Formuli <authrainmedia@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/authrain-cloud-abdullahformuli/lq-ai.git"
+  },
+  "homepage": "https://github.com/authrain-cloud-abdullahformuli/lq-ai#readme",
+  "bugs": {
+    "url": "https://github.com/authrain-cloud-abdullahformuli/lq-ai/issues"
+  },
+  "keywords": [
+    "legal-ai",
+    "legaltech",
+    "citation-engine",
+    "self-hosted",
+    "data-sovereignty",
+    "contract-review",
+    "playbooks",
+    "agent-skills"
+  ]
+}
